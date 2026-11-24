@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egsim"
-version = "0.1.0"
-description = "Konfigurierbare Dummy-Energiegemeinschaften zum Testen der Handelsplattform-API (Datenvertrag 0.2)"
+version = "0.2.0"
+description = "Konfigurierbare Dummy-Energiegemeinschaften zum Testen der Handelsplattform-API (Datenvertrag 0.3.1)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

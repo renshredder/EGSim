@@ -21,18 +21,19 @@ def today_vienna(now: datetime | None = None) -> date:
 
 
 def resolve_delivery_date(spec: str, today: date | None = None) -> date:
-    """'today', 'tomorrow', '+N' (Tage ab heute) oder 'YYYY-MM-DD'."""
+    """'today', 'tomorrow', '+N'/'-N' (Tage ab heute) oder 'YYYY-MM-DD'. Seit Vertrag 0.3 sind auch historische
+    Liefertage handelbar, wenn der Betreiber einen Markt dafür anlegt."""
     today = today or today_vienna()
     s = str(spec).strip().lower()
     if s == "today":
         return today
     if s == "tomorrow":
         return today + timedelta(days=1)
-    if re.fullmatch(r"\+\d+", s):
-        return today + timedelta(days=int(s[1:]))
+    if re.fullmatch(r"[+-]\d+", s):
+        return today + timedelta(days=int(s))
     if _ISO_DATE.match(s):
         return date.fromisoformat(s)
-    raise ValueError(f"Ungültiger Liefertag '{spec}' (erlaubt: today, tomorrow, +N, YYYY-MM-DD)")
+    raise ValueError(f"Ungültiger Liefertag '{spec}' (erlaubt: today, tomorrow, +N, -N, YYYY-MM-DD, open)")
 
 
 def day_bounds_utc(d: date) -> tuple[datetime, datetime]:

@@ -28,14 +28,10 @@ SECRET_KEYS = {"password", "passwordhash", "apikey", "apikeyhash", "secret", "ha
 MAX_ISSUES_PER_RESPONSE = 5
 
 
-# Bekannte Fehler im Vertrag 0.2, die der Prüfer ausgleicht (sonst gäbe es Fehlalarme bei korrekten Plattformen):
-# Die Summenfelder von MarketResult, IntervalResult und Reserve nutzen QuantityKwhNonNegative mit maximum 1.000.000.
-# Das ist die Grenze für EINE Position. Tagessummen dürfen sie überschreiten (SZ-09 reicht allein 1.000.000 kWh ein).
-KNOWN_CONTRACT_ISSUES = [
-    "MarketResult/IntervalResult/Reserve: Summenfelder (totalOfferedKwh, tradableOfferedKwh, totalDemandKwh, "
-    "totalPurchasedKwh, totalSoldKwh, requiredKwh, dispatchedKwh) sind auf 1.000.000 kWh begrenzt. "
-    "Das ist die Grenze einer einzelnen Position. Vorschlag: eigenes Schema ohne maximum.",
-]
+# Bekannte Fehler im Vertrag, die der Prüfer ausgleicht (sonst gäbe es Fehlalarme bei korrekten Plattformen).
+# Vertrag 0.2: Summenfelder nutzten QuantityKwhNonNegative mit maximum 1.000.000 (Grenze EINER Position).
+# Seit 0.3 gibt es dafür QuantityKwhTotal ohne Obergrenze; der Ausgleich greift dann nicht mehr.
+KNOWN_CONTRACT_ISSUES: list[str] = []
 _TOTAL_FIELDS = {
     "MarketResult": ("totalOfferedKwh", "tradableOfferedKwh", "totalDemandKwh", "totalPurchasedKwh", "totalSoldKwh"),
     "IntervalResult": ("totalOfferedKwh", "tradableOfferedKwh", "totalDemandKwh", "totalPurchasedKwh", "totalSoldKwh"),
@@ -45,13 +41,20 @@ _TOTAL_FIELDS = {
 
 def _patch(c: dict) -> dict:
     schemas = c["schemas"]
-    base = schemas["QuantityKwhNonNegative"]
-    schemas["TotalKwhNonNegative"] = {k: v for k, v in base.items() if k != "maximum"}
+    base = schemas.get("QuantityKwhNonNegative")
+    if not base:
+        return c
+    patched = False
     for name, fields in _TOTAL_FIELDS.items():
         for f in fields:
-            prop = schemas[name]["properties"][f]
-            if prop.get("$ref") == "#/components/schemas/QuantityKwhNonNegative":
+            prop = schemas.get(name, {}).get("properties", {}).get(f)
+            if prop and prop.get("$ref") == "#/components/schemas/QuantityKwhNonNegative":
+                schemas["TotalKwhNonNegative"] = {k: v for k, v in base.items() if k != "maximum"}
                 prop["$ref"] = "#/components/schemas/TotalKwhNonNegative"
+                patched = True
+    if patched and not KNOWN_CONTRACT_ISSUES:
+        KNOWN_CONTRACT_ISSUES.append("Summenfelder von MarketResult/IntervalResult/Reserve sind auf 1.000.000 kWh begrenzt "
+                                     "(Grenze einer einzelnen Position) – Prüfer ignoriert diese Grenze.")
     return c
 
 
@@ -254,7 +257,7 @@ def check_response(method: str, template: str, status: int, body: Any, content_t
     documented = str(status) in responses
     schema = responses.get(str(status))
     if not documented:
-        if status not in (401, 403, 500):  # diese Codes gelten laut Vertrag für alle Endpoints
+        if status not in (401, 403, 429, 500):  # diese Codes gelten laut Vertrag für alle Endpoints
             issues.append(("warning", f"Statuscode {status} ist für diesen Endpoint im Vertrag nicht vorgesehen"))
         schema = {"$ref": "#/components/schemas/Error"} if status >= 400 else None
     has_body = body not in (None, "")
@@ -278,4 +281,39 @@ def check_response(method: str, template: str, status: int, body: Any, content_t
     if f"{method} {template}" not in SECRET_OPS:
         for s in _secrets(body)[:3]:
             issues.append(("error", f"{s}: Zugangsdaten dürfen nur in der Antwort der Zugangsdaten-Vergabe stehen"))
+    return issues
+
+
+def contract_minor(v: str | None = None) -> str:
+    """Haupt- und Nebenversion, z. B. '0.3' für '0.3.1'."""
+    parts = (v or version()).strip().split(".")
+    return ".".join(parts[:2])
+
+
+def check_headers(method: str, template: str, status: int, headers: dict[str, str], body: Any,
+                  sent_request_id: str | None = None) -> list[tuple[str, str]]:
+    """Header-Regeln ab Vertrag 0.3: X-Request-Id in jeder Antwort (gesendete wird übernommen), Api-Version,
+    requestId im Fehler-Body gleich dem Header, Retry-After bei 429. `headers` mit kleingeschriebenen Namen."""
+    if status == 0 or f"{method} {template}" not in operations():
+        return []
+    issues: list[tuple[str, str]] = []
+    h = {k.lower(): v for k, v in (headers or {}).items()}
+    rid = h.get("x-request-id")
+    if not rid:
+        issues.append(("error", "Header X-Request-Id fehlt"))
+    elif not 1 <= len(rid) <= 128:
+        issues.append(("error", f"X-Request-Id hat {len(rid)} Zeichen (erlaubt 1–128)"))
+    elif sent_request_id and rid != sent_request_id:
+        issues.append(("error", f"X-Request-Id {rid!r} statt der mitgeschickten {sent_request_id!r}"))
+    api_version = h.get("api-version")
+    if not api_version:
+        issues.append(("error", "Header Api-Version fehlt"))
+    elif contract_minor(api_version) != contract_minor():
+        issues.append(("warning", f"Api-Version {api_version}, EGSim prüft gegen Vertrag {version()}"))
+    if status >= 400 and isinstance(body, dict) and rid and body.get("requestId") not in (None, rid):
+        issues.append(("error", f"requestId im Fehler-Body ({body.get('requestId')!r}) ungleich Header X-Request-Id"))
+    if status == 429:
+        ra = h.get("retry-after", "")
+        if not ra.strip().isdigit():
+            issues.append(("error", f"429 ohne gültigen Header Retry-After (Sekunden), erhalten {ra!r}"))
     return issues

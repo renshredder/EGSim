@@ -1,114 +1,153 @@
 openapi: 3.1.0
 info:
   title: Handelsplattform Energiegemeinschaften
-  version: 0.2.0
+  version: 0.3.1
   description: |
-    Gemeinsamer Datenvertrag der Handelsplattformen (Entwurf 0.2).
+    Gemeinsamer Datenvertrag der Handelsplattformen (Entwurf 0.3.1).
 
-    Version 0.2 setzt die Rückmeldung vom 16.11.2026 um. Die Struktur aus 0.1 bleibt erhalten.
-    Alles, was mit **(Vorschlag)** markiert ist, schlagen wir zur Abstimmung vor. Es ist noch nicht gemeinsam beschlossen.
+    Grundlage ist die korrigierte Fassung 0.2 vom 19.11.2026. Version 0.3 setzt die Rückmeldung der Energiegemeinschaft eg-mmm vom 20.11.2026 um. Version 0.3.1 korrigiert nur Unklarheiten und Widersprüche in 0.3, ohne eine fachliche Regel zu ändern (siehe Abstimmungsprotokoll).
+    Grundlage dafür ist die Laboraufgabe Rev. 2 („Laboraufgabe (Handelsplattform)“, Update 13.10.2026, 21 Folien).
+    Jede Änderung und ihre Quelle steht im Abstimmungsprotokoll. **(Vorschlag)** kennzeichnet Punkte, die noch nicht gemeinsam beschlossen sind.
+
+    ## Geltungsbereich
+    Der Vertrag beschreibt die Daten, die Energiegemeinschaften (EGs) und Handelsplattformen austauschen, und deren Bedeutung.
+    Wie eine Plattform intern Preise bildet und Mengen zuteilt, legt jede Gruppe selbst fest (Laboraufgabe Folie 8, 14).
+    Verbindlich sind nur die Invarianten im Abschnitt „Handelslogik“.
 
     ## Allgemeine Konventionen
-    - Format: JSON, Fehler mit `code` und `message`
-    - Alle IDs sind UUIDs (RFC 9562)
-    - Eigene Kennung einer Ressource heißt immer `id`, Verweise heißen `energyCommunityId` bzw. `positionId`
-    - `deliveryDate`: `YYYY-MM-DD` (Europe/Vienna)
+    - Format: JSON in UTF-8, Feldnamen in camelCase
+    - Sprache: Diese Beschreibung ist deutsch. Feldnamen, Statuswerte, Fehlercodes und Fehlermeldungen (`message`) sind englisch
+    - Alle IDs sind UUIDs (RFC 9562). Eigene Kennung einer Ressource heißt immer `id`, Verweise heißen `energyCommunityId` bzw. `positionId`
+    - Plattformübergreifende EG-Kennung: `communityCode` (siehe „Energiegemeinschaften“)
+    - `deliveryDate`: `YYYY-MM-DD`, Liefertag nach Europe/Vienna
     - Zeitstempel: RFC 3339 (`date-time`), bevorzugt UTC
-    - Mengen in kWh, Preise in EUR/kWh, Beträge in EUR (2 Nachkommastellen)
+    - Mengen in kWh (höchstens 3 Nachkommastellen), Preise in EUR/kWh (höchstens 5), Beträge in EUR (2)
+    - Mengen, Preise und Beträge sind JSON-Zahlen. Server **und** Clients rechnen mit Dezimaltypen, nicht mit Gleitkommazahlen
     - Anmeldung: Web-UI mit `POST /auth/login` (E-Mail und Passwort), danach `Authorization: Bearer <token>`; `POST /auth/logout` macht das Token sofort ungültig. Systeme nutzen den API-Key im Header `X-API-Key`. Alle Endpoints außer Registrierung, Login und `/health/*` brauchen eines von beiden
     - Rollen: `ADMIN` und `ENERGY_COMMUNITY`. Die Rolle ergibt sich aus den Zugangsdaten, `GET /me` zeigt sie an. Jeder Endpoint nennt die erlaubten Rollen in `x-roles`
-    - Registrierung: EGs registrieren sich selbst mit E-Mail (`POST /energy-communities`, Status `PENDING`). Der Admin schaltet sie mit `PUT /energy-communities/{id}/status` frei (`ACTIVE`) und vergibt API-Key und Passwort (`POST /energy-communities/{id}/credentials`), die er der EG manuell übergibt
+    - Registrierung: EGs registrieren sich selbst (`POST /energy-communities`, Status `PENDING`). Der Admin schaltet sie mit `PUT /energy-communities/{id}/status` frei (`ACTIVE`) und vergibt API-Key und Passwort (`POST /energy-communities/{id}/credentials`)
+    - Zugangsdaten werden nur über einen vereinbarten sicheren Kanal übergeben, nie per Chat, Ticket oder E-Mail im Klartext
     - Der Admin-Account (E-Mail, Passwort, API-Key) wird vom Betreiber konfiguriert (z. B. Kubernetes-Secret)
-    - Eine EG sieht und ändert nur ihre eigenen Daten (Profil, Positionen, Zuteilungen, Handelsabschlüsse), fremde Daten: `403` (Details unter „Mandantentrennung“)
+    - Eine EG sieht und ändert nur ihre eigenen Daten, fremde Daten: `403` (siehe „Mandantentrennung“)
     - Nur `ACTIVE`-EGs können sich anmelden und Positionen einreichen, ändern oder stornieren
     - Nur der Admin darf EGs auflisten, löschen, den Status ändern, Zugangsdaten vergeben, Märkte schließen und das Tagesergebnis abrufen
-    - Pro EG, Liefertag und Lieferintervall genau eine Position (`OFFER` oder `DEMAND`). Im Tagesmarkt ist das eine Position pro Liefertag
-    - Ändern und Stornieren nur bis Marktschluss (Markt `OPEN` und `closesAt` noch nicht erreicht)
-    - Reserve nur bei Unterdeckung: `max(D - S, 0)`, wobei `S` nur die **handelbaren** Angebote zählt (siehe „Handels- und Preislogik“)
+    - Pro EG und Liefertag genau eine Position (`OFFER` oder `DEMAND`); bei der optionalen Erweiterung `QUARTER_HOUR` eine pro Intervall
+    - Ob eine Position angenommen wird, hängt nur vom Markt ab: Er muss `OPEN` sein und `closesAt` darf nicht erreicht sein. Das Kalenderdatum allein ist kein Ablehnungsgrund, denn Marktläufe können auch historische Liefertage handeln
 
-    ## Zeitliche Auflösung (Vorschlag, Entscheidung offen)
-    Jeder Markt hat eine feste `resolution`, die der Betreiber pro Liefertag festlegt:
-    - `DAY` (Tagesmarkt): ein Lieferintervall pro Liefertag. Positionen haben kein `intervalStart` (in Antworten `null`). **Für das Labor schlagen wir `DAY` als Standard vor.**
-    - `QUARTER_HOUR` (15-Minuten-Markt): 96 Intervalle pro Liefertag (92 bzw. 100 an den Tagen der Zeitumstellung). Jede Position braucht `intervalStart`.
+    ## Versionierung und Kompatibilität (Vorschlag)
+    - Jede Antwort trägt den Header `Api-Version` mit der Vertragsversion (z. B. `0.3.1`).
+    - Innerhalb einer Hauptversion (z. B. 1.x) sind nur abwärtskompatible Änderungen erlaubt: neue optionale Request-Felder, neue Antwortfelder, neue Endpoints und neue Query-Parameter.
+    - Nicht erlaubt sind: Felder entfernen oder umbenennen, neue Pflichtfelder im Request, Bedeutung oder Einheit ändern, Wertebereiche einschränken.
+    - Clients ignorieren unbekannte Antwortfelder. Neue Statuswerte oder Fehlercodes gibt es nur mit einer neuen Hauptversion.
+    - Pfadpräfix `/v1` ab Version 1.0: offen, siehe Abstimmungsprotokoll.
 
-    Regeln für `intervalStart`:
-    - UTC-Zeitstempel auf einer vollen Viertelstunde (Minute 00, 15, 30 oder 45, Sekunden 0), z. B. `2026-11-20T11:15:00Z`
-    - muss im Liefertag nach Europe/Vienna liegen; das Intervall dauert 15 Minuten
-    - fehlt bei `QUARTER_HOUR`, ist bei `DAY` angegeben oder liegt außerhalb des Liefertags: `400 INVALID_INTERVAL`
+    ## Request-ID und Protokollierung
+    - Clients dürfen den Header `X-Request-Id` mitschicken (1–128 Zeichen). Fehlt er, erzeugt der Server eine UUID.
+    - Jede Antwort enthält `X-Request-Id`, jede Fehlerantwort zusätzlich das Feld `requestId` mit demselben Wert.
+    - Jede Antwort `401` und `403` wird mit Request-ID, Zeitpunkt, angemeldeter Identität (falls vorhanden), Endpoint und Ziel-EG protokolliert. Zugangsdaten erscheinen nie im Log.
 
-    Der Markt wird weiterhin einmal pro Liefertag geschlossen. Matching, Teilzuteilung und Reserve werden aber für jedes Intervall einzeln berechnet.
-    Zuteilungen und Handelsabschlüsse enthalten `intervalStart`, das Tagesergebnis enthält zusätzlich `intervals`.
+    ## Idempotenz und Wiederholungen
+    Wiederholte Requests dürfen kein zweites Geschäft erzeugen (Laboraufgabe Folie 9, 12, 15).
+    - `POST /positions` verlangt den Header `Idempotency-Key` (UUID). Bei `POST /energy-communities` ist er optional.
+    - Gleicher Key und gleicher Inhalt: Der Server führt nichts erneut aus und liefert dieselbe Antwort (Status und Body) wie beim ersten Mal.
+    - Gleicher Key und anderer Inhalt: `409 IDEMPOTENCY_KEY_REUSED`, es wird nichts gespeichert.
+    - Gleicher Inhalt heißt: Der Request-Body ist nach dem Parsen als JSON gleich. Reihenfolge der Felder, Leerzeichen und Zahlenschreibweise (`120` und `120.0`) spielen keine Rolle.
+    - Ein Key gilt pro angemeldeter Identität (EG bzw. Admin). Bei der Registrierung gibt es noch keine Identität, dort gilt der Key plattformweit. Der Server bewahrt ihn mindestens bis zum Settlement des Liefertags auf, bei der Registrierung mindestens 24 Stunden.
+    - Gespeichert wird die erste endgültige Antwort (`2xx` oder `4xx`). Nicht gespeichert werden `401`, `403` (Rolle, EG nicht aktiv) und `429`, weil sie vor der Idempotenzprüfung entstehen. Nach `5xx` darf der Client mit demselben Key erneut senden.
+    - Eine Wiederholung mit gleichem Key und gleichem Inhalt liefert die gespeicherte Antwort auch dann, wenn sich der Zustand inzwischen geändert hat. Beispiel: Die erste Einreichung ergab `201`, die Wiederholung kommt nach `closesAt` und erhält trotzdem dieselbe `201` statt `409 MARKET_CLOSED`.
+    - Parallele Requests mit demselben Key verarbeitet der Server nacheinander. Die Plattform muss parallele Einreichungen so verarbeiten, dass keine Überbuchung entsteht.
+    - Alle anderen schreibenden Endpoints sind von sich aus idempotent: `PUT` ersetzt den Zustand, `DELETE /positions/{id}` auf eine schon stornierte Position liefert `200` ohne Änderung, `close` rechnet nicht doppelt.
 
-    ## Marktanlage und Preiskonfiguration (Betreiberprozess)
-    Der Betreiber legt einen Markt pro `deliveryDate` vor der Annahme von Positionen außerhalb dieser API an,
-    z. B. über Deployment-Konfiguration oder einen betrieblichen Initialisierungsprozess. Dazu werden
-    `resolution` (`DAY` oder `QUARTER_HOUR`), `closesAt` und die drei Preise
-    (`buyPriceEurPerKwh`, `sellPriceEurPerKwh`, `reservePriceEurPerKwh`) vollständig konfiguriert.
-    Ein Markt wird erst nach erfolgreicher Konfiguration als `OPEN` bereitgestellt; bis dahin antworten
-    `GET /markets/{deliveryDate}` und `POST /positions` mit `404 MARKET_NOT_FOUND`.
-    Ab Marktöffnung bleiben Auflösung und Preise unverändert. Die konkrete Implementierung der Marktanlage
-    und Preiskonfiguration ist ein Betreiberprozess und nicht Bestandteil dieser öffentlichen API.
+    ## Marktanlage und Preise
+    Der Betreiber legt einen Markt pro `deliveryDate` außerhalb dieser API an, bevor Positionen angenommen werden, z. B. über Deployment-Konfiguration oder einen betrieblichen Initialisierungsprozess.
+    Dabei legt er `resolution`, `closesAt` und die Preisparameter der Plattform fest. Ein Markt wird erst nach vollständiger Konfiguration als `OPEN` bereitgestellt.
+    Bis dahin antworten `GET /markets/{deliveryDate}` und `POST /positions` mit `404 MARKET_NOT_FOUND`. Die Auflösung bleibt ab Marktöffnung unverändert.
+    Welche Liefertage gehandelt werden, geben die Lehrenden vor. Offene Märkte findet eine EG mit `GET /markets?status=OPEN`.
 
-    ## Handels- und Preislogik (Vorschlag)
-    Die Plattform ist Gegenpartei aller Geschäfte. Sie kauft von anbietenden EGs (`PLATFORM_BUYS`) und verkauft an nachfragende EGs (`PLATFORM_SELLS`).
-    Fehlende Mengen kauft sie als Reserve beim Kraftwerk zu.
+    Preise bildet jede Plattform selbst: ein einheitlicher Tagespreis oder differenzierte Preise sind möglich (Folie 13, 14).
+    - `Market.prices` ist optional, eine **Preisindikation** vor Marktschluss. Eine Plattform mit festen Preisen gibt hier ihre festen Preise an.
+    - Verbindlich ist der Preis jedes Handelsabschlusses (`Trade.priceEurPerKwh`).
+    - `MarketResult.prices` zeigt die durchschnittlichen Preise des Tages, gewichtet nach Menge. Ein Preis ist `null`, wenn es in dieser Richtung kein Geschäft gab, z. B. ohne Nachfrage kein Verkaufspreis.
 
-    **Preise.** Der Betreiber legt pro Markt drei Preise fest. Sie stehen ab Marktöffnung in `Market.prices` und ändern sich bis zum Settlement nicht:
-    - `buyPriceEurPerKwh`: den zahlt die Plattform den anbietenden EGs
-    - `sellPriceEurPerKwh`: den zahlen nachfragende EGs, auch für Mengen aus der Reserve
-    - `reservePriceEurPerKwh`: den zahlt die Plattform dem Kraftwerk für die Reserve
+    ## Zeitliche Auflösung
+    - `DAY` (Tagesmarkt) ist der verbindliche Standard. Positionen haben kein `intervalStart` (in Antworten `null`).
+    - `QUARTER_HOUR` ist eine **optionale Erweiterung** und nicht Teil des Mindestumfangs. Eine Plattform, die sie nicht anbietet, legt keine solchen Märkte an. Bei `QUARTER_HOUR` gibt es 96 Intervalle pro Liefertag (92 bzw. 100 an den Tagen der Zeitumstellung) und jede Position braucht `intervalStart`.
+    - `intervalStart` ist ein UTC-Zeitstempel auf einer vollen Viertelstunde im Liefertag nach Europe/Vienna. Fehlt er bei `QUARTER_HOUR`, ist er bei `DAY` angegeben oder liegt er außerhalb des Liefertags: `400 INVALID_INTERVAL`.
+    - Bei `QUARTER_HOUR` gelten Invarianten und Reserve je Intervall. Zuteilungen und Handelsabschlüsse enthalten `intervalStart`, das Tagesergebnis zusätzlich `intervals`.
 
-    **Matching beim Marktschluss** (bei `QUARTER_HOUR` je Intervall):
+    ## Handelslogik
+    Die Plattform ist Gegenpartei aller Geschäfte. Sie kauft von anbietenden EGs (`PLATFORM_BUYS`) und verkauft an nachfragende EGs (`PLATFORM_SELLS`). Fehlende Mengen erzeugt ihr Reservekraftwerk.
+
+    **Preisvorstellung.** `priceExpectationEurPerKwh` ist optional und nur informativ. Sie ist kein Mindestpreis (Folie 4).
+    Eine Plattform darf sie in ihrer eigenen Zuteilungsregel verwenden, z. B. zur Reihung bei Überangebot (Folie 14).
+    Ein Angebot darf aber nicht allein deshalb ungehandelt bleiben, weil seine Preisvorstellung über dem Ankaufspreis liegt.
+    Verbindliche Mindest- oder Höchstpreise sind nur als gemeinsam abgestimmte Erweiterung zulässig.
+
+    **Verbindliche Invarianten** (Folie 13, 14, 15; bei `QUARTER_HOUR` je Intervall). `S` = Summe aller Angebote, `D` = Summe aller Bedarfe:
     1. Berücksichtigt werden nur Positionen mit Status `CLOSED`.
-    2. Ein Angebot ist **handelbar**, wenn es keine `priceExpectationEurPerKwh` hat oder diese höchstens `buyPriceEurPerKwh` beträgt. Angebote mit höherer Preisvorstellung werden nicht gehandelt (`allocatedKwh: 0`, `reason: PRICE_NOT_MET`).
-    3. `D` = Summe aller Bedarfe, `S` = Summe der handelbaren Angebote.
-    4. Ist `S <= D`, kauft die Plattform alle handelbaren Angebote vollständig. Ist `S > D`, kauft sie nur `D`. Jedes handelbare Angebot erhält dann denselben Anteil `D / S` (Teilzuteilung pro rata, `reason: PARTIALLY_ALLOCATED`). Ist `D = 0`, wird nichts gekauft (`reason: NOT_NEEDED`).
-    5. Reserve: `requiredKwh = max(D - S, 0)`. Angebote, die wegen ihrer Preisvorstellung nicht gehandelt werden, zählen also nicht zu `S` und erhöhen den Reservebedarf.
-    6. Bedarfe werden aus den gekauften Angeboten und der Reserve gedeckt. Liefert das Kraftwerk weniger als `requiredKwh` (`PARTIAL` oder `UNAVAILABLE`), erhält jeder Bedarf denselben Anteil der verfügbaren Menge (`reason: RESERVE_SHORTAGE`).
+    2. Keine Zuteilung ist größer als die eingereichte Menge.
+    3. Die Plattform kauft insgesamt `min(S, D)`, nie mehr als benötigt.
+    4. Reserve: `requiredKwh = max(D - S, 0)`. Ohne Nachfrage gibt es weder Ankauf noch Kraftwerkseinsatz.
+    5. Im Standardfall wird jeder Bedarf vollständig gedeckt. Liefert das Kraftwerk weniger (`PARTIAL`, `UNAVAILABLE`), kürzt die Plattform die Bedarfe nach ihrer dokumentierten Regel (`reason: RESERVE_SHORTAGE`).
+    6. Summen sind konsistent: `totalPurchasedKwh` = Summe der `PLATFORM_BUYS`, `totalSoldKwh` = Summe der `PLATFORM_SELLS`.
+    7. Jeder Betrag ist Menge × Preis, kaufmännisch auf 0,01 EUR gerundet (pro Handelsabschluss).
+    8. `marginEur = salesRevenueEur - purchaseCostEur - reserve.costEur`.
+    9. Gleiche Eingaben und Parameter liefern dasselbe Ergebnis.
 
-    Beispiel Teilzuteilung: handelbare Angebote 100 kWh und 60 kWh, Bedarf 120 kWh. Anteil 120 / 160 = 0,75, Zuteilung 75 kWh und 45 kWh, keine Reserve.
+    **Handelsabschlüsse.** Jeder Trade verweist mit `positionId` auf seine Position. Pro gekauftem Angebot gibt es mindestens einen Trade `PLATFORM_BUYS`, pro gedecktem Bedarf mindestens einen Trade `PLATFORM_SELLS`.
+    Mengen aus der Reserve tragen `fromReserve: true`. Mengen von 0 kWh erzeugen keinen Trade, nur eine Zuteilung.
 
-    **Runden.** Zugeteilte Mengen werden auf 0,001 kWh abgerundet. Den Rest aus dem Abrunden verteilt die Plattform in Schritten von 0,001 kWh nach `createdAt` der Positionen (bei Gleichstand nach `id`).
-    Beträge sind Menge × Preis, pro Handelsabschluss kaufmännisch auf 0,01 EUR gerundet. Für Geldbeträge Dezimalarithmetik verwenden, keine Gleitkommazahlen.
+    **Referenzbeispiel Gruppe 1 (nicht verbindlich).** Gruppe 1 setzt die Invarianten so um:
+    - Pro Markt gibt es feste Preise für Ankauf, Verkauf und Reserve. Sie stehen ab Öffnung in `Market.prices`.
+    - Bei `S > D` erhält jedes Angebot denselben Anteil `D / S` (pro rata).
+    - Mengen werden auf 0,001 kWh abgerundet. Den Rest verteilt die Plattform in Schritten von 0,001 kWh nach `createdAt` (bei Gleichstand nach `id`).
+    - Ein gedeckter Bedarf erhält einen Trade aus Angeboten und, falls nötig, einen zweiten aus der Reserve, beide zum Verkaufspreis. Der Reserveanteil wird pro rata auf die Bedarfe verteilt.
+    Beispiel Überangebot: Angebote 100 kWh und 60 kWh, Bedarf 120 kWh, Anteil 0,75, Zuteilung 75 kWh und 45 kWh, keine Reserve.
 
-    **Handelsabschlüsse.** Jeder Trade verweist mit `positionId` auf die Position, aus der er entstanden ist:
-    - pro gekauftem Angebot ein Trade `PLATFORM_BUYS` zu `buyPriceEurPerKwh`
-    - pro gedecktem Bedarf ein Trade `PLATFORM_SELLS` mit `fromReserve: false` für den Anteil aus Angeboten. Falls Reserve verwendet wurde, kommt ein zweiter Trade mit `fromReserve: true` dazu. Beide kosten `sellPriceEurPerKwh`. Der Reserveanteil wird pro rata auf die Bedarfe verteilt
-    - Mengen von 0 kWh erzeugen keinen Trade, nur eine Zuteilung
+    ## Nachvollziehbarkeit
+    Für jeden Liefertag speichert die Plattform dauerhaft (Folie 12, 16):
+    - die eingegangenen Positionen mit allen Änderungen und Stornierungen
+    - Marktschluss, Zuteilungen, Reserveeinsatz, Handelsabschlüsse und Tagesergebnis
+    - die verwendeten Preisparameter und die Version ihrer Preis- und Zuteilungsregel (`MarketResult.ruleVersion`)
+    - Statuswechsel von EGs mit Zeitpunkt und auslösender Identität
+    - Fehler und abgelehnte Zugriffe mit Request-ID
 
-    **Tagesergebnis.** `purchaseCostEur` ist die Summe der `PLATFORM_BUYS`, `salesRevenueEur` die Summe der `PLATFORM_SELLS`, `reserve.costEur = dispatchedKwh × reservePriceEurPerKwh`.
-    `marginEur = salesRevenueEur - purchaseCostEur - reserve.costEur` (kann negativ sein).
+    ## Energiegemeinschaften
+    - `communityCode` ist die plattformübergreifende Kennung einer EG (z. B. `eg-mmm`). Die EG wählt ihn bei der Registrierung und verwendet auf allen drei Plattformen denselben. (Vorschlag)
+    - Erlaubt: Kleinbuchstaben, Ziffern und einzelne Bindestriche, 3–40 Zeichen. Der Code ist pro Plattform eindeutig, unveränderlich und in jeder EG-Antwort enthalten. Bereits vergeben: `409 COMMUNITY_CODE_ALREADY_REGISTERED`.
+    - `id` bleibt die interne UUID der jeweiligen Plattform.
+    - `PUT /energy-communities/{id}` ändert nur das Profil (`name`, `description`). `status` und `communityCode` sind dort nicht erlaubt (`400 VALIDATION_FAILED`).
+    - Den Status ändert nur der Admin über `PUT /energy-communities/{id}/status`. Erlaubt sind `PENDING → ACTIVE`, `PENDING → SUSPENDED`, `ACTIVE → SUSPENDED`, `SUSPENDED → ACTIVE`. Zurück zu `PENDING` geht nicht, andere Übergänge ergeben `409 INVALID_STATUS_TRANSITION`. Wird derselbe Status erneut gesetzt, antwortet der Server mit `200` ohne Änderung.
+    - Positionen einer EG, die beim Marktschluss nicht `ACTIVE` ist, werden `REJECTED` (`rejectionReason: ENERGY_COMMUNITY_NOT_ACTIVE`).
 
     ## Mandantentrennung und Berechtigungen
     Alle Berechtigungen prüft der Server. Ausgeblendete Buttons in der UI ersetzen keine Prüfung.
     - Welche EG anfragt, ergibt sich nur aus API-Key bzw. Token, nie aus Pfad, Query oder Body.
     - `POST /positions`: Für eine EG ist `energyCommunityId` optional. Fehlt sie, setzt der Server die eigene ID ein. Ist eine fremde ID angegeben: `403 FORBIDDEN`, es wird nichts gespeichert. Der Admin reicht keine Positionen ein (`403 FORBIDDEN`).
-    - Listen (`GET /positions`, `/allocations`, `/trades`): Für eine EG filtert der Server immer auf die eigene EG. Ein Filter `energyCommunityId` mit fremder ID ergibt `403 FORBIDDEN` (keine leere Liste). Der Admin sieht alles und darf frei filtern.
-    - Einzelressourcen (`/positions/{id}`, `/energy-communities/{id}`): Der Server lädt die Ressource und prüft die Eigentümerschaft, bevor er sie zurückgibt oder ändert. Fremde Ressource: `403 FORBIDDEN`.
-    - Zugangsdaten einer EG, die nicht `ACTIVE` ist, werden mit `403 ENERGY_COMMUNITY_NOT_ACTIVE` abgelehnt.
-    - Reihenfolge der Prüfungen: `401` (angemeldet?) → `403` (Rolle, EG aktiv?) → `400` (Format) → `404` (existiert?) → `403` (eigene Ressource?) → `409`/`422` (Zustand).
-    - Passwörter und API-Keys werden nur gehasht gespeichert. Im Klartext erscheinen sie nur einmal in der Antwort von `POST /energy-communities/{id}/credentials`, nie in Logs. Außerhalb von `localhost` nur über HTTPS. (Vorschlag)
+    - Listen (`GET /positions`, `/allocations`, `/trades`): Für eine EG filtert der Server immer auf die eigene EG. Ein Filter `energyCommunityId` mit fremder ID ergibt `403 FORBIDDEN`. Der Admin sieht alles.
+    - Einzelressourcen (`/positions/{id}`, `/energy-communities/{id}`): fremde Ressource `403 FORBIDDEN`. Weil IDs zufällige UUIDs sind, wird bewusst in Kauf genommen, dass `404` und `403` unterscheidbar sind.
+    - Zugangsdaten einer EG, die nicht `ACTIVE` ist: `403 ENERGY_COMMUNITY_NOT_ACTIVE`, auch bei `GET /me` und `GET /markets`.
+    - Reihenfolge der Prüfungen:
+      - Login und Registrierung (ohne Anmeldung): `429` (Rate-Limit bzw. Sperre nach Fehlversuchen) → Idempotenz (nur Registrierung) → `400` → `401 INVALID_CREDENTIALS` bzw. `409` → `403 ENERGY_COMMUNITY_NOT_ACTIVE` (nur Login). Eine gesperrte Anmeldung erhält also `429`, auch wenn das Passwort falsch ist.
+      - Alle anderen Endpoints: `401` → `429` → `403` (Rolle, EG aktiv) → Idempotenz (nur bei `Idempotency-Key`: Header fehlt oder ungültig `400`, bekannter Key mit gleichem Inhalt gespeicherte Antwort, mit anderem Inhalt `409 IDEMPOTENCY_KEY_REUSED`) → `400` → `404` → `403` (eigene Ressource) → `409`.
+    - Passwörter und API-Keys werden nur gehasht gespeichert. Im Klartext erscheinen sie nur einmal in der Antwort von `POST /energy-communities/{id}/credentials`. Außerhalb von `localhost` nur HTTPS.
+    - Registrierung und Login sind öffentlich. Die Plattform begrenzt dort die Anfragen und sperrt nach wiederholten Fehlversuchen vorübergehend: `429 RATE_LIMITED` mit Header `Retry-After` (Sekunden). Die genauen Grenzen legt jede Plattform fest und dokumentiert sie.
 
-    ## Rollen und Statusänderungen
-    - `PUT /energy-communities/{id}` ändert nur das Profil (`name`, `description`). `status` ist dort nicht erlaubt (`400 VALIDATION_FAILED`).
-    - Den Status ändert nur der Admin, und zwar über `PUT /energy-communities/{id}/status`.
-    - Erlaubte Übergänge (Vorschlag): `PENDING → ACTIVE`, `PENDING → SUSPENDED`, `ACTIVE → SUSPENDED`, `SUSPENDED → ACTIVE`. Zurück zu `PENDING` geht nicht. Andere Übergänge: `409 INVALID_STATUS_TRANSITION`. Wird derselbe Status erneut gesetzt, antwortet der Server mit `200` ohne Änderung.
-    - Positionen einer EG, die beim Marktschluss nicht `ACTIVE` ist, werden `REJECTED` (`rejectionReason: ENERGY_COMMUNITY_NOT_ACTIVE`). (Vorschlag)
-
-    ## Statusübergänge bei Marktschluss und Settlement (Vorschlag)
+    ## Statusübergänge bei Marktschluss und Settlement
     Markt:
 
     | Von | Nach | Auslöser |
     |---|---|---|
-    | – | `OPEN` | Betreiber legt den Markt für einen Liefertag an |
+    | – | `OPEN` | Betreiber legt den Markt an |
     | `OPEN` | `CLOSED` | Admin ruft `POST /markets/{deliveryDate}/close` auf. Alle `OPEN`-Positionen werden `CLOSED` bzw. `REJECTED` |
     | `CLOSED` | `SETTLED` | Settlement erfolgreich: Zuteilungen, Trades und Ergebnis werden in einem Schritt (atomar) gespeichert |
     | `CLOSED` | `FAILED` | Settlement fehlgeschlagen: Es wird nichts gespeichert, `failureReason` nennt den Grund |
     | `FAILED` | `CLOSED` | Admin ruft `close` erneut auf (neuer Versuch) |
 
     - Ab `closesAt` lehnt der Server neue, geänderte und stornierte Positionen mit `409 MARKET_CLOSED` ab, auch wenn der Admin den Markt noch nicht geschlossen hat.
+    - `closesAt` ist ein realer Zeitpunkt und unabhängig vom `deliveryDate`. Bei Marktläufen mit historischen Liefertagen liegt `closesAt` nach dem Liefertag. Eine Prüfung `closesAt` < `deliveryDate` ist nicht vorgesehen.
     - `close` ist idempotent: Bei `CLOSED` oder `SETTLED` wird nichts neu berechnet. Bei `FAILED` startet ein erneuter Aufruf einen neuen Versuch.
-    - `close` antwortet immer mit `200` bei `SETTLED` (auch bei erneutem Aufruf) und mit `202` bei `CLOSED` (auch bei erneutem Aufruf während des laufenden Settlements). Beim neuen Versuch nach `FAILED` gilt dieselbe Regel: `200` bei bereits abgeschlossenem, `202` bei noch laufendem Settlement. Bei `202` anschließend `GET /markets/{deliveryDate}` abfragen, bis der Status `SETTLED` oder `FAILED` ist.
+    - `close` antwortet immer mit `200` bei `SETTLED` und mit `202` bei `CLOSED`, auch bei wiederholtem Aufruf. Bei `202` anschließend `GET /markets/{deliveryDate}` abfragen, bis der Status `SETTLED` oder `FAILED` ist.
     - Ergebnisse (`/result`, `/allocations`, `/trades`) gibt es nur bei `SETTLED`, sonst `409 MARKET_NOT_SETTLED`. `SETTLED` ist endgültig.
 
     Position:
@@ -116,68 +155,76 @@ info:
     | Von | Nach | Auslöser |
     |---|---|---|
     | – | `OPEN` | EG reicht die Position ein |
+    | `OPEN` | `OPEN` | EG ändert die Position (`PUT`) |
     | `OPEN` | `CANCELLED` | EG storniert vor Marktschluss |
     | `OPEN` | `CLOSED` | Marktschluss, EG ist `ACTIVE` |
     | `OPEN` | `REJECTED` | Marktschluss, EG ist nicht `ACTIVE` |
     | `CLOSED` | `PROCESSED` | Settlement erfolgreich; es gibt eine Zuteilung, eventuell mit 0 kWh |
 
     `CANCELLED`, `REJECTED` und `PROCESSED` sind Endzustände. Bei `FAILED` bleiben die Positionen `CLOSED`.
+    `PUT /positions/{id}` ersetzt Menge und Preisvorstellung. Fehlt `priceExpectationEurPerKwh`, hat die Position danach keine Preisvorstellung mehr.
 
-    ## Beispielablauf
-    Die Beispiele `flow…` an den Endpoints bilden einen vollständigen Ablauf mit durchgehenden IDs (auch als JSON-Dateien im Ordner `beispiele/`).
-    Liefertag 2026-11-20, Tagesmarkt, Preise: Ankauf 0,10, Verkauf 0,14, Reserve 0,20 EUR/kWh.
-    1. EG Sonnenfeld registriert sich (`PENDING`), der Admin aktiviert sie und vergibt Zugangsdaten, die EG meldet sich an
-    2. EG Sonnenfeld bietet 120 kWh mit Preisvorstellung 0,09 an und ändert auf 100 kWh mit Preisvorstellung 0,08
-    3. EG Windpark Nord bietet 50 kWh mit Preisvorstellung 0,12 an (zu teuer, wird nicht gehandelt)
-    4. EG Altstadt meldet einen Bedarf von 130 kWh an
-    5. Der Admin schließt den Markt. `S` = 100, `D` = 130, Reserve 30 kWh
-    6. Zuteilungen, drei Handelsabschlüsse und Tagesergebnis: Einkauf 10,00 EUR, Verkauf 18,20 EUR, Reserve 6,00 EUR, Marge 2,20 EUR
+    ## Beispiele
+    - Gültige Beispiele: `flow…` an den Endpoints, als Dateien in `beispiele_v0.3/gueltig/`. Ablauf: Liefertag 2026-11-20, Tagesmarkt, Preise der Gruppe 1 (Ankauf 0,10, Verkauf 0,14, Reserve 0,20 EUR/kWh). Angebote 100 kWh und 50 kWh (Preisvorstellung 0,12, trotzdem gehandelt), Bedarf 170 kWh, Reserve 20 kWh. Ergebnis: Einkauf 15,00 EUR, Verkauf 23,80 EUR, Reserve 4,00 EUR, Marge 4,80 EUR.
+    - Ungültige Beispiele: je Fehlercode ein Request mit erwarteter Antwort in `beispiele_v0.3/ungueltig/`.
 
-    ## Validation
-    - IDs: valid UUID in the format `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`; the `id` of an energy community is generated by the platform
-    - `email`: valid email address, at most 254 characters, unique per energy community
-    - `password` (login): required, at most 128 characters; generated passwords have at least 8 characters
-    - `name`: 1-120 characters, not only whitespace
-    - `description` (optional): 1-500 characters
-    - `status`: `PENDING`, `ACTIVE` or `SUSPENDED`; only the admin may set it, and only via `PUT /energy-communities/{id}/status` (new energy communities start as `PENDING`)
-    - `deliveryDate`: format `YYYY-MM-DD`, not in the past
-    - `intervalStart`: required for `QUARTER_HOUR` markets, not allowed for `DAY` markets; UTC on a full quarter hour within the delivery day
-    - `quantityKwh`: greater than 0, at most 1,000,000, at most 3 decimal places
-    - Prices: 0 to 100 EUR/kWh, at most 5 decimal places
-    - Decimal places are checked by the server and reported as `INVALID_QUANTITY` or `INVALID_PRICE` (schema validators handle decimals unreliably)
-    - `priceExpectationEurPerKwh` is optional and only allowed for `OFFER`; it is the minimum price the energy community accepts
-    - Missing required fields or unknown fields: `400 VALIDATION_FAILED` with `details` per field
+    ## Validierung
+    - IDs: gültige UUID im Format `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`; die `id` einer EG vergibt die Plattform
+    - `email`: gültige E-Mail-Adresse, höchstens 254 Zeichen, auf einer Plattform nur einmal registrierbar
+    - `communityCode`: Kleinbuchstaben, Ziffern und einzelne Bindestriche, 3–40 Zeichen, auf einer Plattform eindeutig
+    - `password` (Login): Pflicht, höchstens 128 Zeichen; vergebene Passwörter haben mindestens 8 Zeichen
+    - `name`: 1–120 Zeichen, nicht nur Leerzeichen
+    - `description` (optional): 1–500 Zeichen
+    - `status`: `PENDING`, `ACTIVE` oder `SUSPENDED`; nur der Admin setzt ihn, nur über `PUT /energy-communities/{id}/status`
+    - `deliveryDate`: Format `YYYY-MM-DD`, gültiges Kalenderdatum
+    - `intervalStart`: nur bei `QUARTER_HOUR`, dort Pflicht; UTC auf voller Viertelstunde im Liefertag
+    - `quantityKwh`: größer als 0, höchstens 1.000.000, höchstens 3 Nachkommastellen
+    - Preise: 0 bis 100 EUR/kWh, höchstens 5 Nachkommastellen
+    - Nachkommastellen prüft der Server und meldet sie als `INVALID_QUANTITY` bzw. `INVALID_PRICE` (Schema-Validatoren prüfen Nachkommastellen unzuverlässig)
+    - `priceExpectationEurPerKwh`: optional, nur bei `OFFER`, nur informativ
+    - `Idempotency-Key`: UUID; Pflicht bei `POST /positions`
+    - Fehlende Pflichtfelder oder unbekannte Felder: `400 VALIDATION_FAILED` mit `details` je Feld
 
-    ## Error codes
-    Error format: `{ "code": "...", "message": "...", "details": [{ "field": "/quantityKwh", "code": "...", "message": "..." }] }`
+    ## Fehlercodes
+    Fehlerformat: `{ "code": "...", "message": "...", "requestId": "...", "details": [{ "field": "/quantityKwh", "code": "...", "message": "..." }] }`
 
-    | HTTP | Code | Meaning |
+    | HTTP | Code | Bedeutung |
     |---|---|---|
-    | 400 | `VALIDATION_FAILED` | At least one field is invalid. |
-    | 400 | `INVALID_ID` | The ID is not a valid UUID. |
-    | 400 | `INVALID_DELIVERY_DATE` | deliveryDate must be in the format YYYY-MM-DD. |
-    | 400 | `INVALID_INTERVAL` | intervalStart is missing, not allowed or not a quarter hour of the delivery day. |
-    | 400 | `INVALID_POSITION_TYPE` | type must be OFFER or DEMAND. |
-    | 400 | `INVALID_QUANTITY` | quantityKwh must be greater than 0 (max. 3 decimal places). |
-    | 400 | `INVALID_PRICE` | The price must be between 0 and 100 EUR/kWh (max. 5 decimal places). |
-    | 401 | `UNAUTHORIZED` | API key or token is missing, invalid or expired. |
-    | 401 | `INVALID_CREDENTIALS` | Email or password is wrong. |
-    | 403 | `FORBIDDEN` | You are not allowed to access this resource or perform this action. |
-    | 403 | `ENERGY_COMMUNITY_NOT_ACTIVE` | The energy community is not active (pending approval or suspended). |
-    | 404 | `ENERGY_COMMUNITY_NOT_FOUND` | The energy community does not exist. |
-    | 404 | `POSITION_NOT_FOUND` | The position does not exist. |
-    | 404 | `MARKET_NOT_FOUND` | No market exists for the delivery date. |
-    | 409 | `EMAIL_ALREADY_REGISTERED` | An energy community with this email is already registered. |
-    | 409 | `ENERGY_COMMUNITY_IN_USE` | The energy community cannot be deleted because it has positions or trades. |
-    | 409 | `INVALID_STATUS_TRANSITION` | This status change is not allowed. |
-    | 409 | `POSITION_ALREADY_EXISTS` | A position already exists for this energy community, delivery date and interval. |
-    | 409 | `POSITION_NOT_MODIFIABLE` | The position is cancelled or already processed and can no longer be changed. |
-    | 409 | `MARKET_CLOSED` | The market is already closed. |
-    | 409 | `MARKET_NOT_SETTLED` | The market result is not available yet. |
-    | 422 | `DELIVERY_DATE_IN_PAST` | The delivery date is in the past. |
-    | 500 | `INTERNAL_ERROR` | Internal error. |
+    | 400 | `VALIDATION_FAILED` | Mindestens ein Feld oder Header ist ungültig. |
+    | 400 | `INVALID_ID` | Die ID ist keine gültige UUID. |
+    | 400 | `INVALID_DELIVERY_DATE` | `deliveryDate` ist kein gültiges Datum im Format `YYYY-MM-DD`. |
+    | 400 | `INVALID_INTERVAL` | `intervalStart` fehlt, ist nicht erlaubt oder keine Viertelstunde des Liefertags. |
+    | 400 | `INVALID_POSITION_TYPE` | `type` ist nicht `OFFER` oder `DEMAND`. |
+    | 400 | `INVALID_QUANTITY` | `quantityKwh` ist nicht größer als 0 oder hat mehr als 3 Nachkommastellen. |
+    | 400 | `INVALID_PRICE` | Der Preis liegt nicht zwischen 0 und 100 EUR/kWh oder hat mehr als 5 Nachkommastellen. |
+    | 401 | `UNAUTHORIZED` | API-Key oder Token fehlt, ist ungültig oder abgelaufen. |
+    | 401 | `INVALID_CREDENTIALS` | E-Mail oder Passwort ist falsch. |
+    | 403 | `FORBIDDEN` | Zugriff oder Aktion ist nicht erlaubt. |
+    | 403 | `ENERGY_COMMUNITY_NOT_ACTIVE` | Die EG ist nicht aktiv (noch nicht freigeschaltet oder gesperrt). |
+    | 404 | `ENERGY_COMMUNITY_NOT_FOUND` | Die EG existiert nicht. |
+    | 404 | `POSITION_NOT_FOUND` | Die Position existiert nicht. |
+    | 404 | `MARKET_NOT_FOUND` | Für den Liefertag gibt es keinen Markt. |
+    | 409 | `EMAIL_ALREADY_REGISTERED` | Mit dieser E-Mail ist schon eine EG registriert. |
+    | 409 | `COMMUNITY_CODE_ALREADY_REGISTERED` | Dieser `communityCode` ist schon vergeben. |
+    | 409 | `ENERGY_COMMUNITY_IN_USE` | Die EG hat Positionen oder Handelsabschlüsse und kann nicht gelöscht werden. |
+    | 409 | `INVALID_STATUS_TRANSITION` | Dieser Statuswechsel ist nicht erlaubt. |
+    | 409 | `POSITION_ALREADY_EXISTS` | Für diese EG, diesen Liefertag und dieses Intervall gibt es schon eine Position. |
+    | 409 | `POSITION_NOT_MODIFIABLE` | Die Position ist nicht mehr `OPEN` und kann nicht geändert werden. |
+    | 409 | `IDEMPOTENCY_KEY_REUSED` | Der `Idempotency-Key` wurde schon mit anderem Inhalt verwendet. |
+    | 409 | `MARKET_CLOSED` | Der Markt ist geschlossen oder `closesAt` ist erreicht. |
+    | 409 | `MARKET_NOT_SETTLED` | Das Marktergebnis liegt noch nicht vor. |
+    | 429 | `RATE_LIMITED` | Zu viele Anfragen; nach `Retry-After` Sekunden erneut versuchen. |
+    | 500 | `INTERNAL_ERROR` | Interner Fehler. |
 servers:
 - url: http://localhost:8080
+  description: Lokale Entwicklung
+- url: https://{host}
+  description: Kubernetes-Cluster. Hostnamen nach dem Schema <gruppe>-<dienst>.machasing.com; die drei Plattform-Hosts trägt
+    das Infrastrukturteam ein (offen).
+  variables:
+    host:
+      default: gruppe1-handel.machasing.com
+      description: Platzhalter, bis die Hostnamen feststehen
 tags:
 - name: Authentication
   description: Rolle und Identität zum API-Key
@@ -202,7 +249,7 @@ paths:
       summary: Mit E-Mail und Passwort anmelden
       description: 'Rollen: Ohne Anmeldung. EGs, die nicht ACTIVE sind, erhalten 403 ENERGY_COMMUNITY_NOT_ACTIVE.'
       operationId: login
-      x-roles: &id003 []
+      x-roles: []
       security: []
       requestBody:
         required: true
@@ -231,14 +278,20 @@ paths:
                     tokenType: Bearer
                     expiresIn: 3600
                     role: ENERGY_COMMUNITY
-                    energyCommunity: &id002
+                    energyCommunity:
                       id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
                       email: kontakt@eg-sonnenfeld.example
+                      communityCode: eg-sonnenfeld
                       name: EG Sonnenfeld
                       description: Photovoltaik-Gemeinschaft
                       status: ACTIVE
                       createdAt: '2026-11-17T08:00:00Z'
                       updatedAt: '2026-11-17T09:30:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -248,6 +301,11 @@ paths:
               examples:
                 VALIDATION_FAILED:
                   $ref: '#/components/examples/VALIDATION_FAILED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -257,6 +315,11 @@ paths:
               examples:
                 INVALID_CREDENTIALS:
                   $ref: '#/components/examples/INVALID_CREDENTIALS'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -266,6 +329,27 @@ paths:
               examples:
                 ENERGY_COMMUNITY_NOT_ACTIVE:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '429':
+          description: Too Many Requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                RATE_LIMITED:
+                  $ref: '#/components/examples/RATE_LIMITED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+            Retry-After:
+              $ref: '#/components/headers/Retry-After'
         '500':
           description: Internal Server Error
           content:
@@ -275,6 +359,13 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /auth/logout:
     post:
       tags:
@@ -282,7 +373,7 @@ paths:
       summary: Abmelden
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten).'
       operationId: logout
-      x-roles: &id001
+      x-roles:
       - ADMIN
       - ENERGY_COMMUNITY
       security:
@@ -290,6 +381,11 @@ paths:
       responses:
         '204':
           description: No Content
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -299,6 +395,25 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -308,6 +423,13 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /me:
     get:
       tags:
@@ -315,7 +437,9 @@ paths:
       summary: Eigene Rolle und EG abrufen
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten).'
       operationId: getMe
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -331,11 +455,24 @@ paths:
                   summary: Als EG angemeldet
                   value:
                     role: ENERGY_COMMUNITY
-                    energyCommunity: *id002
+                    energyCommunity:
+                      id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                      email: kontakt@eg-sonnenfeld.example
+                      communityCode: eg-sonnenfeld
+                      name: EG Sonnenfeld
+                      description: Photovoltaik-Gemeinschaft
+                      status: ACTIVE
+                      createdAt: '2026-11-17T08:00:00Z'
+                      updatedAt: '2026-11-17T09:30:00Z'
                 admin:
                   summary: Als Admin angemeldet
                   value:
                     role: ADMIN
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -345,6 +482,25 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -354,6 +510,13 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /energy-communities:
     post:
       tags:
@@ -361,7 +524,7 @@ paths:
       summary: EG registrieren
       description: 'Rollen: Ohne Anmeldung. Neue EGs starten immer mit Status PENDING.'
       operationId: registerEnergyCommunity
-      x-roles: *id003
+      x-roles: []
       security: []
       requestBody:
         required: true
@@ -374,6 +537,7 @@ paths:
                 summary: 'Ablauf 1: EG Sonnenfeld registriert sich'
                 value:
                   email: kontakt@eg-sonnenfeld.example
+                  communityCode: eg-sonnenfeld
                   name: EG Sonnenfeld
                   description: Photovoltaik-Gemeinschaft
       responses:
@@ -389,11 +553,17 @@ paths:
                   value:
                     id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
                     email: kontakt@eg-sonnenfeld.example
+                    communityCode: eg-sonnenfeld
                     name: EG Sonnenfeld
                     description: Photovoltaik-Gemeinschaft
                     status: PENDING
                     createdAt: '2026-11-17T08:00:00Z'
                     updatedAt: '2026-11-17T08:00:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -403,6 +573,11 @@ paths:
               examples:
                 VALIDATION_FAILED:
                   $ref: '#/components/examples/VALIDATION_FAILED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -412,6 +587,31 @@ paths:
               examples:
                 EMAIL_ALREADY_REGISTERED:
                   $ref: '#/components/examples/EMAIL_ALREADY_REGISTERED'
+                COMMUNITY_CODE_ALREADY_REGISTERED:
+                  $ref: '#/components/examples/COMMUNITY_CODE_ALREADY_REGISTERED'
+                IDEMPOTENCY_KEY_REUSED:
+                  $ref: '#/components/examples/IDEMPOTENCY_KEY_REUSED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '429':
+          description: Too Many Requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                RATE_LIMITED:
+                  $ref: '#/components/examples/RATE_LIMITED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+            Retry-After:
+              $ref: '#/components/headers/Retry-After'
         '500':
           description: Internal Server Error
           content:
@@ -421,13 +621,21 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      - $ref: '#/components/parameters/XRequestId'
     get:
       tags:
       - Energy Communities
       summary: EGs auflisten
       description: 'Rollen: Nur ADMIN.'
       operationId: listEnergyCommunities
-      x-roles: &id004
+      x-roles:
       - ADMIN
       security:
       - ApiKeyAuth: []
@@ -437,6 +645,7 @@ paths:
         in: query
         schema:
           $ref: '#/components/schemas/EnergyCommunityStatus'
+      - $ref: '#/components/parameters/XRequestId'
       responses:
         '200':
           description: OK
@@ -446,6 +655,23 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/EnergyCommunity'
+              examples:
+                all:
+                  summary: Alle EGs (Admin)
+                  value:
+                  - id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    email: kontakt@eg-sonnenfeld.example
+                    communityCode: eg-sonnenfeld
+                    name: EG Sonnenfeld
+                    description: Photovoltaik-Gemeinschaft
+                    status: ACTIVE
+                    createdAt: '2026-11-17T08:00:00Z'
+                    updatedAt: '2026-11-17T09:30:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -455,6 +681,11 @@ paths:
               examples:
                 VALIDATION_FAILED:
                   $ref: '#/components/examples/VALIDATION_FAILED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -464,6 +695,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -473,6 +709,11 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -482,6 +723,11 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
   /energy-communities/{id}:
     parameters:
     - $ref: '#/components/parameters/EnergyCommunityId'
@@ -491,7 +737,9 @@ paths:
       summary: EG abrufen
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Fremde EG: 403 FORBIDDEN.'
       operationId: getEnergyCommunity
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -502,6 +750,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EnergyCommunity'
+              examples:
+                own:
+                  summary: Eigene EG
+                  value:
+                    id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    email: kontakt@eg-sonnenfeld.example
+                    communityCode: eg-sonnenfeld
+                    name: EG Sonnenfeld
+                    description: Photovoltaik-Gemeinschaft
+                    status: ACTIVE
+                    createdAt: '2026-11-17T08:00:00Z'
+                    updatedAt: '2026-11-17T09:30:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -511,6 +776,11 @@ paths:
               examples:
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -520,6 +790,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -529,6 +804,13 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -538,6 +820,11 @@ paths:
               examples:
                 ENERGY_COMMUNITY_NOT_FOUND:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -547,6 +834,13 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
     put:
       tags:
       - Energy Communities
@@ -555,7 +849,9 @@ paths:
         Status wird ausschließlich über PUT /energy-communities/{id}/status geändert; ein Feld status im Body ergibt 400 VALIDATION_FAILED.
         Fremde EG: 403 FORBIDDEN.'
       operationId: updateEnergyCommunity
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -583,11 +879,17 @@ paths:
                   value:
                     id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
                     email: kontakt@eg-sonnenfeld.example
+                    communityCode: eg-sonnenfeld
                     name: EG Sonnenfeld
                     description: Photovoltaik und Speicher
                     status: ACTIVE
                     createdAt: '2026-11-17T08:00:00Z'
                     updatedAt: '2026-11-17T12:00:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -599,6 +901,11 @@ paths:
                   $ref: '#/components/examples/VALIDATION_FAILED'
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -608,6 +915,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -617,6 +929,13 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -626,6 +945,11 @@ paths:
               examples:
                 ENERGY_COMMUNITY_NOT_FOUND:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -635,19 +959,32 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
     delete:
       tags:
       - Energy Communities
       summary: EG löschen
       description: 'Rollen: Nur ADMIN.'
       operationId: deleteEnergyCommunity
-      x-roles: *id004
+      x-roles:
+      - ADMIN
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
       responses:
         '204':
           description: No Content
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -657,6 +994,11 @@ paths:
               examples:
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -666,6 +1008,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -675,6 +1022,11 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -684,6 +1036,11 @@ paths:
               examples:
                 ENERGY_COMMUNITY_NOT_FOUND:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -693,6 +1050,11 @@ paths:
               examples:
                 ENERGY_COMMUNITY_IN_USE:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_IN_USE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -702,6 +1064,13 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /energy-communities/{id}/credentials:
     parameters:
     - $ref: '#/components/parameters/EnergyCommunityId'
@@ -712,7 +1081,8 @@ paths:
       description: 'Rollen: Nur ADMIN. Neue Zugangsdaten ersetzen alte; alte API-Keys und Tokens werden ungültig. Klartext
         nur in dieser Antwort.'
       operationId: issueCredentials
-      x-roles: *id004
+      x-roles:
+      - ADMIN
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -729,6 +1099,11 @@ paths:
                   value:
                     apiKey: <einmalig angezeigter API-Key>
                     password: <einmalig angezeigtes Passwort>
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -738,6 +1113,11 @@ paths:
               examples:
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -747,6 +1127,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -756,6 +1141,11 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -765,6 +1155,11 @@ paths:
               examples:
                 ENERGY_COMMUNITY_NOT_FOUND:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -774,6 +1169,13 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /energy-communities/{id}/status:
     parameters:
     - $ref: '#/components/parameters/EnergyCommunityId'
@@ -782,7 +1184,7 @@ paths:
       - Energy Communities
       summary: Status einer EG ändern
       description: 'Rollen: Nur ADMIN. Getrennt von der Profilbearbeitung. Erlaubt: PENDING → ACTIVE, PENDING → SUSPENDED,
-        ACTIVE → SUSPENDED, SUSPENDED → ACTIVE (Vorschlag). Gleicher Status: 200 ohne Änderung.'
+        ACTIVE → SUSPENDED, SUSPENDED → ACTIVE. Gleicher Status: 200 ohne Änderung.'
       operationId: changeEnergyCommunityStatus
       x-roles:
       - ADMIN
@@ -814,7 +1216,20 @@ paths:
               examples:
                 flow02_activate:
                   summary: 'Ablauf 2: EG ist ACTIVE'
-                  value: *id002
+                  value:
+                    id: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    email: kontakt@eg-sonnenfeld.example
+                    communityCode: eg-sonnenfeld
+                    name: EG Sonnenfeld
+                    description: Photovoltaik-Gemeinschaft
+                    status: ACTIVE
+                    createdAt: '2026-11-17T08:00:00Z'
+                    updatedAt: '2026-11-17T09:30:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -826,6 +1241,11 @@ paths:
                   $ref: '#/components/examples/VALIDATION_FAILED'
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -835,6 +1255,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -844,6 +1269,11 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -853,6 +1283,11 @@ paths:
               examples:
                 ENERGY_COMMUNITY_NOT_FOUND:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -862,6 +1297,11 @@ paths:
               examples:
                 INVALID_STATUS_TRANSITION:
                   $ref: '#/components/examples/INVALID_STATUS_TRANSITION'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -871,15 +1311,23 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /positions:
     post:
       tags:
       - Positions
       summary: Angebot oder Bedarf einreichen
       description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Die EG ergibt sich aus den Zugangsdaten. energyCommunityId
-        ist optional; eine fremde ID ergibt 403 FORBIDDEN.'
+        ist optional; eine fremde ID ergibt 403 FORBIDDEN. Verlangt Idempotency-Key; eine Wiederholung mit gleichem Key und
+        Inhalt liefert dieselbe Antwort, ohne eine zweite Position anzulegen.'
       operationId: submitPosition
-      x-roles: &id005
+      x-roles:
       - ENERGY_COMMUNITY
       requestBody:
         required: true
@@ -895,21 +1343,21 @@ paths:
                   type: OFFER
                   quantityKwh: 120
                   priceExpectationEurPerKwh: 0.09
-              flow08_offerB:
-                summary: 'Ablauf 8: EG Windpark Nord bietet 50 kWh zu mind. 0,12 an'
+              flow09_offerB:
+                summary: 'Ablauf 9: EG Windpark Nord bietet 50 kWh an (Preisvorstellung 0,12, nur informativ)'
                 value:
                   deliveryDate: '2026-11-20'
                   type: OFFER
                   quantityKwh: 50
                   priceExpectationEurPerKwh: 0.12
-              flow09_demandC:
-                summary: 'Ablauf 9: EG Altstadt braucht 130 kWh'
+              flow10_demandC:
+                summary: 'Ablauf 10: EG Altstadt braucht 170 kWh'
                 value:
                   deliveryDate: '2026-11-20'
                   type: DEMAND
-                  quantityKwh: 130
+                  quantityKwh: 170
               quarterHourOffer:
-                summary: '15-Minuten-Markt: Angebot für 12:15–12:30 Uhr Wiener Zeit'
+                summary: 'Optionale Erweiterung QUARTER_HOUR: Angebot für 12:15–12:30 Uhr Wiener Zeit'
                 value:
                   deliveryDate: '2026-11-20'
                   intervalStart: '2026-11-20T11:15:00Z'
@@ -925,7 +1373,7 @@ paths:
                 $ref: '#/components/schemas/Position'
               examples:
                 flow06_offerA:
-                  summary: Ablauf 6
+                  summary: 'Ablauf 6 (auch Ablauf 7: Wiederholung mit gleichem Idempotency-Key)'
                   value:
                     id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
                     energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
@@ -938,8 +1386,8 @@ paths:
                     rejectionReason: null
                     createdAt: '2026-11-18T09:00:00Z'
                     updatedAt: '2026-11-18T09:00:00Z'
-                flow08_offerB:
-                  summary: Ablauf 8
+                flow09_offerB:
+                  summary: Ablauf 9
                   value:
                     id: 7c2b9a4f-3ea5-4b88-8d2f-1a6f9b8c2345
                     energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
@@ -952,21 +1400,21 @@ paths:
                     rejectionReason: null
                     createdAt: '2026-11-18T09:20:00Z'
                     updatedAt: '2026-11-18T09:20:00Z'
-                flow09_demandC:
-                  summary: Ablauf 9
+                flow10_demandC:
+                  summary: Ablauf 10
                   value:
                     id: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
                     energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
                     deliveryDate: '2026-11-20'
                     intervalStart: null
                     type: DEMAND
-                    quantityKwh: 130
+                    quantityKwh: 170
                     status: OPEN
                     rejectionReason: null
                     createdAt: '2026-11-18T09:40:00Z'
                     updatedAt: '2026-11-18T09:40:00Z'
                 quarterHourOffer:
-                  summary: 15-Minuten-Markt
+                  summary: QUARTER_HOUR
                   value:
                     id: d4c6eb85-4a99-4fc1-9e73-96a51c28dbfa
                     energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
@@ -979,6 +1427,11 @@ paths:
                     rejectionReason: null
                     createdAt: '2026-11-18T09:00:00Z'
                     updatedAt: '2026-11-18T09:00:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1000,6 +1453,13 @@ paths:
                   $ref: '#/components/examples/INVALID_PRICE'
                 INVALID_INTERVAL:
                   $ref: '#/components/examples/INVALID_INTERVAL'
+                VALIDATION_FAILED_IDEMPOTENCY_KEY:
+                  $ref: '#/components/examples/VALIDATION_FAILED_IDEMPOTENCY_KEY'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1009,6 +1469,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden (z. B. fremde energyCommunityId, Admin, EG nicht ACTIVE)
           content:
@@ -1022,6 +1487,11 @@ paths:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
                 FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
                   $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1033,6 +1503,11 @@ paths:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_FOUND'
                 MARKET_NOT_FOUND:
                   $ref: '#/components/examples/MARKET_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -1044,15 +1519,13 @@ paths:
                   $ref: '#/components/examples/POSITION_ALREADY_EXISTS'
                 MARKET_CLOSED:
                   $ref: '#/components/examples/MARKET_CLOSED'
-        '422':
-          description: Unprocessable Entity
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              examples:
-                DELIVERY_DATE_IN_PAST:
-                  $ref: '#/components/examples/DELIVERY_DATE_IN_PAST'
+                IDEMPOTENCY_KEY_REUSED:
+                  $ref: '#/components/examples/IDEMPOTENCY_KEY_REUSED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1062,9 +1535,17 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/XRequestId'
     get:
       tags:
       - Positions
@@ -1072,7 +1553,9 @@ paths:
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Für EGs filtert der Server immer auf
         die eigene EG.'
       operationId: listPositions
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       parameters:
       - name: energyCommunityId
         in: query
@@ -1096,6 +1579,7 @@ paths:
         in: query
         schema:
           $ref: '#/components/schemas/PositionStatus'
+      - $ref: '#/components/parameters/XRequestId'
       responses:
         '200':
           description: OK
@@ -1109,8 +1593,7 @@ paths:
                 ownPositions:
                   summary: EG Sonnenfeld sieht nur eigene Positionen
                   value:
-                  - &id006
-                    id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                  - id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
                     energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
                     deliveryDate: '2026-11-20'
                     intervalStart: null
@@ -1121,6 +1604,11 @@ paths:
                     rejectionReason: null
                     createdAt: '2026-11-18T09:00:00Z'
                     updatedAt: '2026-11-18T10:15:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1138,6 +1626,11 @@ paths:
                   $ref: '#/components/examples/INVALID_POSITION_TYPE'
                 INVALID_INTERVAL:
                   $ref: '#/components/examples/INVALID_INTERVAL'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1147,6 +1640,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1158,6 +1656,13 @@ paths:
                   $ref: '#/components/examples/FORBIDDEN'
                 FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
                   $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1167,6 +1672,11 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -1179,7 +1689,9 @@ paths:
       summary: Position abrufen
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Fremde Position: 403 FORBIDDEN.'
       operationId: getPosition
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       responses:
         '200':
           description: OK
@@ -1188,7 +1700,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Position'
               examples:
-                flow13_processed:
+                processed:
                   summary: 'Nach dem Settlement: PROCESSED'
                   value:
                     id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
@@ -1202,6 +1714,11 @@ paths:
                     rejectionReason: null
                     createdAt: '2026-11-18T09:00:00Z'
                     updatedAt: '2026-11-19T11:00:05Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1211,6 +1728,11 @@ paths:
               examples:
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1220,6 +1742,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1229,6 +1756,13 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1238,6 +1772,11 @@ paths:
               examples:
                 POSITION_NOT_FOUND:
                   $ref: '#/components/examples/POSITION_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1247,17 +1786,26 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
     put:
       tags:
       - Positions
       summary: Position ändern
       description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Nur eigene Positionen mit Status OPEN, solange der Markt
-        offen ist. priceExpectationEurPerKwh darf nur bei einer gespeicherten OFFER-Position geändert werden; bei DEMAND mit diesem Feld: 400 VALIDATION_FAILED, keine Änderung.'
+        offen ist. Ersetzt Menge und Preisvorstellung; fehlt priceExpectationEurPerKwh, hat die Position danach keine. priceExpectationEurPerKwh
+        nur bei OFFER; bei DEMAND: 400 VALIDATION_FAILED.'
       operationId: updatePosition
-      x-roles: *id005
+      x-roles:
+      - ENERGY_COMMUNITY
       requestBody:
         required: true
         content:
@@ -1265,8 +1813,8 @@ paths:
             schema:
               $ref: '#/components/schemas/PositionUpdate'
             examples:
-              flow07_updateA:
-                summary: 'Ablauf 7: EG Sonnenfeld ändert auf 100 kWh zu mind. 0,08'
+              flow08_updateA:
+                summary: 'Ablauf 8: EG Sonnenfeld ändert auf 100 kWh, Preisvorstellung 0,08'
                 value:
                   quantityKwh: 100
                   priceExpectationEurPerKwh: 0.08
@@ -1278,9 +1826,25 @@ paths:
               schema:
                 $ref: '#/components/schemas/Position'
               examples:
-                flow07_updateA:
-                  summary: Ablauf 7
-                  value: *id006
+                flow08_updateA:
+                  summary: Ablauf 8
+                  value:
+                    id: 6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234
+                    energyCommunityId: 3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    type: OFFER
+                    quantityKwh: 100
+                    priceExpectationEurPerKwh: 0.08
+                    status: OPEN
+                    rejectionReason: null
+                    createdAt: '2026-11-18T09:00:00Z'
+                    updatedAt: '2026-11-18T10:15:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1296,6 +1860,11 @@ paths:
                   $ref: '#/components/examples/INVALID_QUANTITY'
                 INVALID_PRICE:
                   $ref: '#/components/examples/INVALID_PRICE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1305,6 +1874,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1316,6 +1890,11 @@ paths:
                   $ref: '#/components/examples/FORBIDDEN'
                 ENERGY_COMMUNITY_NOT_ACTIVE:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1325,6 +1904,11 @@ paths:
               examples:
                 POSITION_NOT_FOUND:
                   $ref: '#/components/examples/POSITION_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -1336,6 +1920,11 @@ paths:
                   $ref: '#/components/examples/MARKET_CLOSED'
                 POSITION_NOT_MODIFIABLE:
                   $ref: '#/components/examples/POSITION_NOT_MODIFIABLE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1345,17 +1934,25 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
     delete:
       tags:
       - Positions
       summary: Position stornieren
       description: 'Rollen: Nur ENERGY_COMMUNITY (nur eigene Daten). Setzt den Status auf CANCELLED (kein Löschen). Nur vor
-        Marktschluss.'
+        Marktschluss. Ist die Position schon CANCELLED, antwortet der Server mit 200 ohne Änderung.'
       operationId: cancelPosition
-      x-roles: *id005
+      x-roles:
+      - ENERGY_COMMUNITY
       responses:
         '200':
           description: OK
@@ -1377,6 +1974,11 @@ paths:
                     rejectionReason: null
                     createdAt: '2026-11-18T08:00:00Z'
                     updatedAt: '2026-11-18T08:30:00Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1386,6 +1988,11 @@ paths:
               examples:
                 INVALID_ID:
                   $ref: '#/components/examples/INVALID_ID'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1395,6 +2002,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1406,6 +2018,11 @@ paths:
                   $ref: '#/components/examples/FORBIDDEN'
                 ENERGY_COMMUNITY_NOT_ACTIVE:
                   $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1415,6 +2032,11 @@ paths:
               examples:
                 POSITION_NOT_FOUND:
                   $ref: '#/components/examples/POSITION_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -1426,6 +2048,11 @@ paths:
                   $ref: '#/components/examples/MARKET_CLOSED'
                 POSITION_NOT_MODIFIABLE:
                   $ref: '#/components/examples/POSITION_NOT_MODIFIABLE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1435,6 +2062,119 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      security:
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
+  /markets:
+    get:
+      tags:
+      - Markets
+      summary: Märkte auflisten
+      description: 'Rollen: ADMIN und ENERGY_COMMUNITY. Alle Rollen sehen dieselben Märkte, sortiert nach deliveryDate.'
+      operationId: listMarkets
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
+      parameters:
+      - name: status
+        in: query
+        schema:
+          $ref: '#/components/schemas/MarketStatus'
+        description: z. B. OPEN für alle Märkte, die Positionen annehmen.
+      - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Market'
+              examples:
+                flow05_openMarkets:
+                  summary: 'Ablauf 5: offene Märkte (status=OPEN)'
+                  value:
+                  - deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: OPEN
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
+                    closesAt: '2026-11-19T11:00:00Z'
+                    closedAt: null
+                    settledAt: null
+                    failureReason: null
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                VALIDATION_FAILED:
+                  $ref: '#/components/examples/VALIDATION_FAILED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                UNAUTHORIZED:
+                  $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                INTERNAL_ERROR:
+                  $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -1445,9 +2185,11 @@ paths:
       tags:
       - Markets
       summary: Marktstatus abrufen
-      description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten).'
+      description: 'Rollen: ADMIN und ENERGY_COMMUNITY. Alle Rollen sehen denselben Markt.'
       operationId: getMarket
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       responses:
         '200':
           description: OK
@@ -1457,12 +2199,12 @@ paths:
                 $ref: '#/components/schemas/Market'
               examples:
                 flow05_open:
-                  summary: 'Ablauf 5: Markt offen, Preise bekannt'
+                  summary: 'Markt offen, mit Preisindikation (Gruppe 1: feste Preise)'
                   value:
                     deliveryDate: '2026-11-20'
                     resolution: DAY
                     status: OPEN
-                    prices: &id007
+                    prices:
                       deliveryDate: '2026-11-20'
                       buyPriceEurPerKwh: 0.1
                       sellPriceEurPerKwh: 0.14
@@ -1471,17 +2213,36 @@ paths:
                     closedAt: null
                     settledAt: null
                     failureReason: null
-                flow11_settled:
-                  summary: 'Ablauf 11: Markt abgewickelt'
+                openWithoutIndication:
+                  summary: Markt offen, ohne Preisindikation (Plattform mit dynamischen Preisen)
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: OPEN
+                    closesAt: '2026-11-19T11:00:00Z'
+                    closedAt: null
+                    settledAt: null
+                    failureReason: null
+                flow12_settled:
+                  summary: 'Ablauf 12: Markt abgewickelt'
                   value:
                     deliveryDate: '2026-11-20'
                     resolution: DAY
                     status: SETTLED
-                    prices: *id007
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
                     closesAt: '2026-11-19T11:00:00Z'
                     closedAt: '2026-11-19T11:00:02Z'
                     settledAt: '2026-11-19T11:00:05Z'
                     failureReason: null
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1491,6 +2252,11 @@ paths:
               examples:
                 INVALID_DELIVERY_DATE:
                   $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1500,6 +2266,25 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1509,6 +2294,11 @@ paths:
               examples:
                 MARKET_NOT_FOUND:
                   $ref: '#/components/examples/MARKET_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1518,9 +2308,16 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /markets/{deliveryDate}/close:
     parameters:
     - $ref: '#/components/parameters/DeliveryDate'
@@ -1529,9 +2326,11 @@ paths:
       - Markets
       summary: Markt schließen und abwickeln
       description: 'Rollen: Nur ADMIN. Schließt den Markt und startet das Settlement (siehe Statusübergänge). Idempotent:
-        Bei CLOSED oder SETTLED wird nichts neu berechnet. Bei FAILED startet ein neuer Versuch. Rückgabe: 200 bei SETTLED, 202 bei CLOSED, auch bei Wiederholungsaufrufen.'
+        Bei CLOSED oder SETTLED wird nichts neu berechnet. Bei FAILED startet ein neuer Versuch. Rückgabe: 200 bei SETTLED,
+        202 bei CLOSED, auch bei Wiederholungsaufrufen.'
       operationId: closeMarket
-      x-roles: *id004
+      x-roles:
+      - ADMIN
       responses:
         '200':
           description: Markt ist SETTLED (Settlement abgeschlossen; auch bei wiederholtem Aufruf)
@@ -1540,17 +2339,26 @@ paths:
               schema:
                 $ref: '#/components/schemas/Market'
               examples:
-                flow10_close:
-                  summary: 'Ablauf 10: Markt geschlossen und abgewickelt'
+                flow11_close:
+                  summary: 'Ablauf 11: Markt geschlossen und abgewickelt'
                   value:
                     deliveryDate: '2026-11-20'
                     resolution: DAY
                     status: SETTLED
-                    prices: *id007
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
                     closesAt: '2026-11-19T11:00:00Z'
                     closedAt: '2026-11-19T11:00:02Z'
                     settledAt: '2026-11-19T11:00:05Z'
                     failureReason: null
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '202':
           description: Markt ist CLOSED (Settlement läuft; auch bei wiederholtem Aufruf)
           content:
@@ -1564,11 +2372,20 @@ paths:
                     deliveryDate: '2026-11-20'
                     resolution: DAY
                     status: CLOSED
-                    prices: *id007
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
                     closesAt: '2026-11-19T11:00:00Z'
                     closedAt: '2026-11-19T11:00:02Z'
                     settledAt: null
                     failureReason: null
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1578,6 +2395,11 @@ paths:
               examples:
                 INVALID_DELIVERY_DATE:
                   $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1587,6 +2409,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1596,6 +2423,11 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1605,6 +2437,11 @@ paths:
               examples:
                 MARKET_NOT_FOUND:
                   $ref: '#/components/examples/MARKET_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1614,9 +2451,16 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /markets/{deliveryDate}/result:
     parameters:
     - $ref: '#/components/parameters/DeliveryDate'
@@ -1626,7 +2470,8 @@ paths:
       summary: Tagesergebnis abrufen
       description: 'Rollen: Nur ADMIN.'
       operationId: getMarketResult
-      x-roles: *id004
+      x-roles:
+      - ADMIN
       responses:
         '200':
           description: OK
@@ -1635,38 +2480,68 @@ paths:
               schema:
                 $ref: '#/components/schemas/MarketResult'
               examples:
-                flow14_result:
-                  summary: 'Ablauf 14: Tagesergebnis'
+                flow15_result:
+                  summary: 'Ablauf 15: Tagesergebnis'
                   value:
                     deliveryDate: '2026-11-20'
                     resolution: DAY
                     status: SETTLED
                     settledAt: '2026-11-19T11:00:05Z'
+                    ruleVersion: gruppe1-prorata-1.0
                     totalOfferedKwh: 150
-                    tradableOfferedKwh: 100
-                    totalDemandKwh: 130
-                    totalPurchasedKwh: 100
-                    totalSoldKwh: 130
+                    totalDemandKwh: 170
+                    totalPurchasedKwh: 150
+                    totalSoldKwh: 170
                     reserve:
                       deliveryDate: '2026-11-20'
                       status: COVERED
-                      requiredKwh: 30
-                      dispatchedKwh: 30
+                      requiredKwh: 20
+                      dispatchedKwh: 20
                       priceEurPerKwh: 0.2
-                      costEur: 6.0
-                    prices: *id007
-                    purchaseCostEur: 10.0
-                    salesRevenueEur: 18.2
-                    marginEur: 2.2
+                      costEur: 4.0
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
+                    purchaseCostEur: 15.0
+                    salesRevenueEur: 23.8
+                    marginEur: 4.8
+                noDemand:
+                  summary: 'Keine Nachfrage: kein Ankauf, keine Reserve, kein Verkaufspreis'
+                  value:
+                    deliveryDate: '2026-11-20'
+                    resolution: DAY
+                    status: SETTLED
+                    settledAt: '2026-11-19T11:00:05Z'
+                    ruleVersion: gruppe1-prorata-1.0
+                    totalOfferedKwh: 150
+                    totalDemandKwh: 0
+                    totalPurchasedKwh: 0
+                    totalSoldKwh: 0
+                    reserve:
+                      deliveryDate: '2026-11-20'
+                      status: NOT_NEEDED
+                      requiredKwh: 0
+                      dispatchedKwh: 0
+                      priceEurPerKwh: null
+                      costEur: 0.0
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: null
+                      sellPriceEurPerKwh: null
+                      reservePriceEurPerKwh: null
+                    purchaseCostEur: 0.0
+                    salesRevenueEur: 0.0
+                    marginEur: 0.0
                 quarterHour:
-                  summary: 15-Minuten-Markt (gekürzt auf 2 von 96 Intervallen)
+                  summary: Optionale Erweiterung QUARTER_HOUR (gekürzt auf 2 von 96 Intervallen)
                   value:
                     deliveryDate: '2026-11-20'
                     resolution: QUARTER_HOUR
                     status: SETTLED
                     settledAt: '2026-11-19T11:00:05Z'
                     totalOfferedKwh: 3.5
-                    tradableOfferedKwh: 2.5
                     totalDemandKwh: 3.0
                     totalPurchasedKwh: 1.8
                     totalSoldKwh: 3.0
@@ -1677,14 +2552,17 @@ paths:
                       dispatchedKwh: 1.2
                       priceEurPerKwh: 0.2
                       costEur: 0.24
-                    prices: *id007
+                    prices:
+                      deliveryDate: '2026-11-20'
+                      buyPriceEurPerKwh: 0.1
+                      sellPriceEurPerKwh: 0.14
+                      reservePriceEurPerKwh: 0.2
                     purchaseCostEur: 0.18
                     salesRevenueEur: 0.42
                     marginEur: 0.0
                     intervals:
                     - intervalStart: '2026-11-19T23:00:00Z'
                       totalOfferedKwh: 0
-                      tradableOfferedKwh: 0
                       totalDemandKwh: 1.2
                       totalPurchasedKwh: 0
                       totalSoldKwh: 1.2
@@ -1697,7 +2575,6 @@ paths:
                         costEur: 0.24
                     - intervalStart: '2026-11-20T11:15:00Z'
                       totalOfferedKwh: 3.5
-                      tradableOfferedKwh: 2.5
                       totalDemandKwh: 1.8
                       totalPurchasedKwh: 1.8
                       totalSoldKwh: 1.8
@@ -1708,6 +2585,11 @@ paths:
                         dispatchedKwh: 0
                         priceEurPerKwh: null
                         costEur: 0.0
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1717,6 +2599,11 @@ paths:
               examples:
                 INVALID_DELIVERY_DATE:
                   $ref: '#/components/examples/INVALID_DELIVERY_DATE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1726,6 +2613,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1735,6 +2627,11 @@ paths:
               examples:
                 FORBIDDEN:
                   $ref: '#/components/examples/FORBIDDEN'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1744,6 +2641,11 @@ paths:
               examples:
                 MARKET_NOT_FOUND:
                   $ref: '#/components/examples/MARKET_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -1753,6 +2655,11 @@ paths:
               examples:
                 MARKET_NOT_SETTLED:
                   $ref: '#/components/examples/MARKET_NOT_SETTLED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1762,9 +2669,16 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /markets/{deliveryDate}/allocations:
     parameters:
     - $ref: '#/components/parameters/DeliveryDate'
@@ -1774,7 +2688,9 @@ paths:
       summary: Zuteilungen abrufen
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Für EGs nur eigene Zuteilungen.'
       operationId: listAllocations
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       parameters:
       - name: energyCommunityId
         in: query
@@ -1786,6 +2702,7 @@ paths:
         description: Nur bei QUARTER_HOUR-Märkten.
         schema:
           $ref: '#/components/schemas/IntervalStart'
+      - $ref: '#/components/parameters/XRequestId'
       responses:
         '200':
           description: OK
@@ -1796,8 +2713,8 @@ paths:
                 items:
                   $ref: '#/components/schemas/Allocation'
               examples:
-                flow12_allocationsAdmin:
-                  summary: 'Ablauf 12: alle Zuteilungen (Admin)'
+                flow13_allocationsAdmin:
+                  summary: 'Ablauf 13: alle Zuteilungen (Admin)'
                   value:
                   - deliveryDate: '2026-11-20'
                     intervalStart: null
@@ -1807,29 +2724,35 @@ paths:
                     requestedKwh: 100
                     allocatedKwh: 100
                     reason: FULLY_ALLOCATED
-                  - &id008
-                    deliveryDate: '2026-11-20'
+                  - deliveryDate: '2026-11-20'
                     intervalStart: null
                     positionId: 7c2b9a4f-3ea5-4b88-8d2f-1a6f9b8c2345
                     energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
                     type: OFFER
                     requestedKwh: 50
-                    allocatedKwh: 0
-                    reason: PRICE_NOT_MET
+                    allocatedKwh: 50
+                    reason: FULLY_ALLOCATED
                   - deliveryDate: '2026-11-20'
                     intervalStart: null
                     positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
                     energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
                     type: DEMAND
-                    requestedKwh: 130
-                    allocatedKwh: 130
+                    requestedKwh: 170
+                    allocatedKwh: 170
                     reason: FULLY_ALLOCATED
-                flow12_allocationsOwn:
-                  summary: 'Ablauf 12: EG Windpark Nord sieht nur ihre (Preis nicht erreicht)'
+                flow13_allocationsOwn:
+                  summary: 'Ablauf 13: EG Windpark Nord sieht nur ihre'
                   value:
-                  - *id008
+                  - deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 7c2b9a4f-3ea5-4b88-8d2f-1a6f9b8c2345
+                    energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
+                    type: OFFER
+                    requestedKwh: 50
+                    allocatedKwh: 50
+                    reason: FULLY_ALLOCATED
                 partialAllocation:
-                  summary: 'Teilzuteilung pro rata (anderer Markt): 100 + 60 kWh Angebot, 120 kWh Bedarf'
+                  summary: 'Referenzbeispiel Gruppe 1, Überangebot pro rata: 100 + 60 kWh Angebot, 120 kWh Bedarf'
                   value:
                   - deliveryDate: '2026-11-20'
                     intervalStart: null
@@ -1855,6 +2778,11 @@ paths:
                     requestedKwh: 120
                     allocatedKwh: 120
                     reason: FULLY_ALLOCATED
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -1870,6 +2798,11 @@ paths:
                   $ref: '#/components/examples/INVALID_ID'
                 INVALID_INTERVAL:
                   $ref: '#/components/examples/INVALID_INTERVAL'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -1879,6 +2812,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -1890,6 +2828,13 @@ paths:
                   $ref: '#/components/examples/FORBIDDEN'
                 FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
                   $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -1899,6 +2844,11 @@ paths:
               examples:
                 MARKET_NOT_FOUND:
                   $ref: '#/components/examples/MARKET_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -1908,6 +2858,11 @@ paths:
               examples:
                 MARKET_NOT_SETTLED:
                   $ref: '#/components/examples/MARKET_NOT_SETTLED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -1917,6 +2872,11 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -1929,7 +2889,9 @@ paths:
       summary: Handelsabschlüsse abrufen
       description: 'Rollen: ADMIN (alle Daten) und ENERGY_COMMUNITY (nur eigene Daten). Für EGs nur eigene Handelsabschlüsse.'
       operationId: listTrades
-      x-roles: *id001
+      x-roles:
+      - ADMIN
+      - ENERGY_COMMUNITY
       parameters:
       - name: energyCommunityId
         in: query
@@ -1950,6 +2912,7 @@ paths:
         description: Alle Handelsabschlüsse zu einer Position.
         schema:
           $ref: '#/components/schemas/PositionId'
+      - $ref: '#/components/parameters/XRequestId'
       responses:
         '200':
           description: OK
@@ -1960,8 +2923,8 @@ paths:
                 items:
                   $ref: '#/components/schemas/Trade'
               examples:
-                flow13_tradesAdmin:
-                  summary: 'Ablauf 13: alle Handelsabschlüsse (Admin)'
+                flow14_tradesAdmin:
+                  summary: 'Ablauf 14: alle Handelsabschlüsse (Admin)'
                   value:
                   - id: 9d2e7a41-0c55-4b8e-9a3f-52c1d8e4f7b6
                     deliveryDate: '2026-11-20'
@@ -1974,35 +2937,69 @@ paths:
                     priceEurPerKwh: 0.1
                     amountEur: 10.0
                     createdAt: '2026-11-19T11:00:05Z'
-                  - &id009
-                    id: a1f3b852-1d66-4c9f-8b40-63d2e9f5a8c7
+                  - id: c3e5d074-4f88-4ea1-8b62-95f4e1a7c0d9
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 7c2b9a4f-3ea5-4b88-8d2f-1a6f9b8c2345
+                    energyCommunityId: 5a2d9e71-8c4b-4f1e-9b3a-7e6f2c1d0b21
+                    direction: PLATFORM_BUYS
+                    fromReserve: false
+                    quantityKwh: 50
+                    priceEurPerKwh: 0.1
+                    amountEur: 5.0
+                    createdAt: '2026-11-19T11:00:05Z'
+                  - id: a1f3b852-1d66-4c9f-8b40-63d2e9f5a8c7
                     deliveryDate: '2026-11-20'
                     intervalStart: null
                     positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
                     energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
                     direction: PLATFORM_SELLS
                     fromReserve: false
-                    quantityKwh: 100
+                    quantityKwh: 150
                     priceEurPerKwh: 0.14
-                    amountEur: 14.0
+                    amountEur: 21.0
                     createdAt: '2026-11-19T11:00:05Z'
-                  - &id010
-                    id: b2a4c963-2e77-4daf-9c51-74e3fa06b9d8
+                  - id: b2a4c963-2e77-4daf-9c51-74e3fa06b9d8
                     deliveryDate: '2026-11-20'
                     intervalStart: null
                     positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
                     energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
                     direction: PLATFORM_SELLS
                     fromReserve: true
-                    quantityKwh: 30
+                    quantityKwh: 20
                     priceEurPerKwh: 0.14
-                    amountEur: 4.2
+                    amountEur: 2.8
                     createdAt: '2026-11-19T11:00:05Z'
-                flow13_tradesOwn:
-                  summary: 'Ablauf 13: EG Altstadt, Anteil Angebote und Anteil Reserve'
+                flow14_tradesOwn:
+                  summary: 'Ablauf 14: EG Altstadt, Anteil Angebote und Anteil Reserve'
                   value:
-                  - *id009
-                  - *id010
+                  - id: a1f3b852-1d66-4c9f-8b40-63d2e9f5a8c7
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    direction: PLATFORM_SELLS
+                    fromReserve: false
+                    quantityKwh: 150
+                    priceEurPerKwh: 0.14
+                    amountEur: 21.0
+                    createdAt: '2026-11-19T11:00:05Z'
+                  - id: b2a4c963-2e77-4daf-9c51-74e3fa06b9d8
+                    deliveryDate: '2026-11-20'
+                    intervalStart: null
+                    positionId: 8d3cab50-4fb6-4c99-9e30-2b7a0c9d3456
+                    energyCommunityId: 8e4b2f19-1d7a-4c6e-a5b2-3c9d8e7f6a32
+                    direction: PLATFORM_SELLS
+                    fromReserve: true
+                    quantityKwh: 20
+                    priceEurPerKwh: 0.14
+                    amountEur: 2.8
+                    createdAt: '2026-11-19T11:00:05Z'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '400':
           description: Bad Request
           content:
@@ -2018,6 +3015,11 @@ paths:
                   $ref: '#/components/examples/INVALID_ID'
                 INVALID_INTERVAL:
                   $ref: '#/components/examples/INVALID_INTERVAL'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '401':
           description: Unauthorized
           content:
@@ -2027,6 +3029,11 @@ paths:
               examples:
                 UNAUTHORIZED:
                   $ref: '#/components/examples/UNAUTHORIZED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '403':
           description: Forbidden
           content:
@@ -2038,6 +3045,13 @@ paths:
                   $ref: '#/components/examples/FORBIDDEN'
                 FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
                   $ref: '#/components/examples/FORBIDDEN_FOREIGN_ENERGY_COMMUNITY'
+                ENERGY_COMMUNITY_NOT_ACTIVE:
+                  $ref: '#/components/examples/ENERGY_COMMUNITY_NOT_ACTIVE'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '404':
           description: Not Found
           content:
@@ -2047,6 +3061,11 @@ paths:
               examples:
                 MARKET_NOT_FOUND:
                   $ref: '#/components/examples/MARKET_NOT_FOUND'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '409':
           description: Conflict
           content:
@@ -2056,6 +3075,11 @@ paths:
               examples:
                 MARKET_NOT_SETTLED:
                   $ref: '#/components/examples/MARKET_NOT_SETTLED'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '500':
           description: Internal Server Error
           content:
@@ -2065,6 +3089,11 @@ paths:
               examples:
                 INTERNAL_ERROR:
                   $ref: '#/components/examples/INTERNAL_ERROR'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
       security:
       - ApiKeyAuth: []
       - BearerAuth: []
@@ -2075,7 +3104,7 @@ paths:
       summary: Liveness-Probe
       description: 'Rollen: Ohne Anmeldung.'
       operationId: livenessProbe
-      x-roles: *id003
+      x-roles: []
       security: []
       responses:
         '200':
@@ -2091,6 +3120,13 @@ paths:
                     status: UP
                     checks:
                       database: UP
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
   /health/ready:
     get:
       tags:
@@ -2098,7 +3134,7 @@ paths:
       summary: Readiness-Probe
       description: 'Rollen: Ohne Anmeldung.'
       operationId: readinessProbe
-      x-roles: *id003
+      x-roles: []
       security: []
       responses:
         '200':
@@ -2114,12 +3150,24 @@ paths:
                     status: UP
                     checks:
                       database: UP
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
         '503':
           description: Not ready (e.g. database unavailable)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Health'
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Api-Version:
+              $ref: '#/components/headers/Api-Version'
+      parameters:
+      - $ref: '#/components/parameters/XRequestId'
 components:
   securitySchemes:
     ApiKeyAuth:
@@ -2152,6 +3200,31 @@ components:
       required: true
       schema:
         $ref: '#/components/schemas/DeliveryDate'
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Optional. Wird in Antwort und Log übernommen.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID, die der Client pro fachlichem Vorgang einmal erzeugt und bei Wiederholungen unverändert mitschickt.
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: UUID, die der Client pro fachlichem Vorgang einmal erzeugt und bei Wiederholungen unverändert mitschickt.
+      schema:
+        type: string
+        format: uuid
   schemas:
     EnergyCommunityId:
       type: string
@@ -2246,24 +3319,30 @@ components:
       - POSITION_NOT_FOUND
       - MARKET_NOT_FOUND
       - EMAIL_ALREADY_REGISTERED
+      - COMMUNITY_CODE_ALREADY_REGISTERED
       - ENERGY_COMMUNITY_IN_USE
       - INVALID_STATUS_TRANSITION
       - POSITION_ALREADY_EXISTS
       - POSITION_NOT_MODIFIABLE
+      - IDEMPOTENCY_KEY_REUSED
       - MARKET_CLOSED
       - MARKET_NOT_SETTLED
-      - DELIVERY_DATE_IN_PAST
+      - RATE_LIMITED
       - INTERNAL_ERROR
     Error:
       type: object
       required:
       - code
       - message
+      - requestId
       properties:
         code:
           $ref: '#/components/schemas/ErrorCode'
         message:
           type: string
+        requestId:
+          type: string
+          description: Gleicher Wert wie der Antwort-Header X-Request-Id.
         details:
           type: array
           items:
@@ -2285,6 +3364,7 @@ components:
       required:
       - id
       - email
+      - communityCode
       - name
       - status
       - createdAt
@@ -2296,6 +3376,8 @@ components:
           type: string
           format: email
           maxLength: 254
+        communityCode:
+          $ref: '#/components/schemas/CommunityCode'
         name:
           type: string
         description:
@@ -2328,8 +3410,7 @@ components:
           $ref: '#/components/schemas/QuantityKwh'
         priceExpectationEurPerKwh:
           $ref: '#/components/schemas/PriceEurPerKwh'
-          description: 'Nur bei OFFER: Mindestpreis, zu dem die EG verkauft. Liegt er über buyPriceEurPerKwh, wird das Angebot
-            nicht gehandelt.'
+          description: Nur bei OFFER, optional und nur informativ. Kein Mindestpreis.
       if:
         properties:
           type:
@@ -2342,7 +3423,9 @@ components:
           - priceExpectationEurPerKwh
     PositionUpdate:
       type: object
-      description: 'Der Server prüft den Typ der bereits gespeicherten Position: priceExpectationEurPerKwh ist nur bei OFFER zulässig. Bei DEMAND und übergebenem Preisfeld: 400 VALIDATION_FAILED; die Position bleibt unverändert. Diese Regel hängt von der gespeicherten Ressource ab und kann nicht allein durch das Request-Schema validiert werden.'
+      description: 'Ersetzt Menge und Preisvorstellung. Fehlt priceExpectationEurPerKwh, hat die Position danach keine. priceExpectationEurPerKwh
+        ist nur bei einer gespeicherten OFFER-Position zulässig; bei DEMAND mit diesem Feld: 400 VALIDATION_FAILED, die Position
+        bleibt unverändert.'
       required:
       - quantityKwh
       additionalProperties: false
@@ -2395,7 +3478,6 @@ components:
       - deliveryDate
       - resolution
       - status
-      - prices
       - closesAt
       properties:
         deliveryDate:
@@ -2405,11 +3487,11 @@ components:
         status:
           $ref: '#/components/schemas/MarketStatus'
         prices:
-          $ref: '#/components/schemas/Prices'
-          description: Ab Marktöffnung bekannt und bis zum Settlement unverändert (Vorschlag).
+          $ref: '#/components/schemas/PriceIndication'
+          description: 'Optional: Preisindikation vor Marktschluss (nicht verbindlich).'
         closesAt:
           $ref: '#/components/schemas/Timestamp'
-          description: Ab diesem Zeitpunkt werden keine Positionen mehr angenommen, geändert oder storniert.
+          description: Ab diesem Zeitpunkt werden keine Positionen mehr angenommen, geändert oder storniert. Realer Zeitpunkt, unabhängig vom deliveryDate (bei historischen Liefertagen liegt er danach).
         closedAt:
           oneOf:
           - $ref: '#/components/schemas/Timestamp'
@@ -2501,11 +3583,19 @@ components:
         deliveryDate:
           $ref: '#/components/schemas/DeliveryDate'
         buyPriceEurPerKwh:
-          $ref: '#/components/schemas/PriceEurPerKwh'
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
         sellPriceEurPerKwh:
-          $ref: '#/components/schemas/PriceEurPerKwh'
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
         reservePriceEurPerKwh:
-          $ref: '#/components/schemas/PriceEurPerKwh'
+          oneOf:
+          - $ref: '#/components/schemas/PriceEurPerKwh'
+          - type: 'null'
+      description: Durchschnittspreise des Liefertags, gewichtet nach Menge. null, wenn es in dieser Richtung kein Geschäft
+        bzw. keine Reserve gab.
     Reserve:
       type: object
       required:
@@ -2520,10 +3610,10 @@ components:
         status:
           $ref: '#/components/schemas/ReserveStatus'
         requiredKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
-          description: max(D - S, 0), S = Summe der handelbaren Angebote.
+          $ref: '#/components/schemas/QuantityKwhTotal'
+          description: max(D - S, 0)
         dispatchedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         priceEurPerKwh:
           oneOf:
           - $ref: '#/components/schemas/PriceEurPerKwh'
@@ -2538,7 +3628,6 @@ components:
       - status
       - settledAt
       - totalOfferedKwh
-      - tradableOfferedKwh
       - totalDemandKwh
       - totalPurchasedKwh
       - totalSoldKwh
@@ -2556,21 +3645,27 @@ components:
           $ref: '#/components/schemas/MarketStatus'
         settledAt:
           $ref: '#/components/schemas/Timestamp'
+        ruleVersion:
+          type: string
+          maxLength: 64
+          description: 'Optional: Version der Preis- und Zuteilungsregel der Plattform, mit der gerechnet wurde.'
+          examples:
+          - gruppe1-prorata-1.0
         totalOfferedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
-        tradableOfferedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
-          description: Summe der Angebote, deren Preisvorstellung erfüllt ist (S).
+          $ref: '#/components/schemas/QuantityKwhTotal'
+          description: 'S: Summe aller Angebote, die beim Marktschluss CLOSED wurden (nach dem Settlement PROCESSED).'
         totalDemandKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
+          description: 'D: Summe aller Bedarfe, die beim Marktschluss CLOSED wurden (nach dem Settlement PROCESSED).'
         totalPurchasedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         totalSoldKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         reserve:
           $ref: '#/components/schemas/Reserve'
         prices:
           $ref: '#/components/schemas/Prices'
+          description: Durchschnittspreise des Tages (siehe Prices).
         purchaseCostEur:
           $ref: '#/components/schemas/AmountEur'
         salesRevenueEur:
@@ -2628,7 +3723,7 @@ components:
           type: string
           minLength: 1
           maxLength: 500
-      description: Profil bearbeiten. Der Status ist hier nicht erlaubt (nur PUT /energy-communities/{id}/status).
+      description: Profil bearbeiten. status und communityCode sind hier nicht erlaubt (400 VALIDATION_FAILED).
     Me:
       type: object
       required:
@@ -2645,6 +3740,7 @@ components:
       type: object
       required:
       - email
+      - communityCode
       - name
       additionalProperties: false
       properties:
@@ -2652,6 +3748,8 @@ components:
           type: string
           format: email
           maxLength: 254
+        communityCode:
+          $ref: '#/components/schemas/CommunityCode'
         name:
           type: string
           minLength: 1
@@ -2715,7 +3813,8 @@ components:
       enum:
       - DAY
       - QUARTER_HOUR
-      description: Zeitliche Auflösung des Markts (Vorschlag). DAY = ein Intervall pro Liefertag, QUARTER_HOUR = 15-Minuten-Intervalle.
+      description: Zeitliche Auflösung des Markts. DAY = Tagesmarkt (verbindlicher Standard), QUARTER_HOUR = 15-Minuten-Intervalle
+        (optionale Erweiterung).
     IntervalStart:
       type: string
       format: date-time
@@ -2733,18 +3832,17 @@ components:
       enum:
       - FULLY_ALLOCATED
       - PARTIALLY_ALLOCATED
-      - PRICE_NOT_MET
+      - NOT_ALLOCATED
       - NOT_NEEDED
       - RESERVE_SHORTAGE
-      description: 'Warum die Zuteilung so ausfällt (Vorschlag). FULLY_ALLOCATED: volle Menge. PARTIALLY_ALLOCATED: Angebot
-        pro rata gekürzt, weil handelbare Angebote den Bedarf übersteigen. PRICE_NOT_MET: Preisvorstellung über buyPriceEurPerKwh,
-        nicht gehandelt. NOT_NEEDED: kein Bedarf vorhanden. RESERVE_SHORTAGE: Bedarf gekürzt, weil die Reserve nicht reicht.'
+      description: 'FULLY_ALLOCATED: volle Menge. PARTIALLY_ALLOCATED: Angebot wegen Überangebot nur teilweise gekauft. NOT_ALLOCATED:
+        Angebot wegen Überangebot gar nicht gekauft (nach der Zuteilungsregel der Plattform). NOT_NEEDED: es gab keinen Bedarf.
+        RESERVE_SHORTAGE: Bedarf gekürzt, weil die Reserve nicht reichte.'
     IntervalResult:
       type: object
       required:
       - intervalStart
       - totalOfferedKwh
-      - tradableOfferedKwh
       - totalDemandKwh
       - totalPurchasedKwh
       - totalSoldKwh
@@ -2753,15 +3851,13 @@ components:
         intervalStart:
           $ref: '#/components/schemas/IntervalStart'
         totalOfferedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
-        tradableOfferedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         totalDemandKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         totalPurchasedKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         totalSoldKwh:
-          $ref: '#/components/schemas/QuantityKwhNonNegative'
+          $ref: '#/components/schemas/QuantityKwhTotal'
         reserve:
           $ref: '#/components/schemas/Reserve'
     EnergyCommunityStatusUpdate:
@@ -2772,128 +3868,223 @@ components:
       properties:
         status:
           $ref: '#/components/schemas/EnergyCommunityStatus'
+    CommunityCode:
+      type: string
+      minLength: 3
+      maxLength: 40
+      pattern: ^[a-z0-9]+(-[a-z0-9]+)*$
+      description: Plattformübergreifende Kennung der EG (Vorschlag). Unveränderlich, pro Plattform eindeutig.
+      examples:
+      - eg-mmm
+    QuantityKwhTotal:
+      type: number
+      minimum: 0
+      x-maxDecimals: 3
+      description: Summe über mehrere Positionen; ohne Obergrenze.
+    PriceIndication:
+      type: object
+      required:
+      - deliveryDate
+      - buyPriceEurPerKwh
+      - sellPriceEurPerKwh
+      - reservePriceEurPerKwh
+      properties:
+        deliveryDate:
+          $ref: '#/components/schemas/DeliveryDate'
+        buyPriceEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+        sellPriceEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+        reservePriceEurPerKwh:
+          $ref: '#/components/schemas/PriceEurPerKwh'
+      description: Optionale Preisindikation vor Marktschluss, nicht verbindlich. Plattformen mit festen Preisen geben hier
+        ihre festen Preise an.
   examples:
-    VALIDATION_FAILED:
-      summary: 400 VALIDATION_FAILED
+    COMMUNITY_CODE_ALREADY_REGISTERED:
+      summary: 409 COMMUNITY_CODE_ALREADY_REGISTERED
       value:
-        code: VALIDATION_FAILED
-        message: At least one field is invalid.
-        details:
-        - field: /quantityKwh
-          code: INVALID_QUANTITY
-          message: quantityKwh must be greater than 0.
-    INVALID_ID:
-      summary: 400 INVALID_ID
-      value:
-        code: INVALID_ID
-        message: The ID is not a valid UUID.
-    INVALID_DELIVERY_DATE:
-      summary: 400 INVALID_DELIVERY_DATE
-      value:
-        code: INVALID_DELIVERY_DATE
-        message: deliveryDate must be in the format YYYY-MM-DD.
-    INVALID_INTERVAL:
-      summary: 400 INVALID_INTERVAL
-      value:
-        code: INVALID_INTERVAL
-        message: intervalStart is missing, not allowed or not a quarter hour of the delivery day.
-    INVALID_POSITION_TYPE:
-      summary: 400 INVALID_POSITION_TYPE
-      value:
-        code: INVALID_POSITION_TYPE
-        message: type must be OFFER or DEMAND.
-    INVALID_QUANTITY:
-      summary: 400 INVALID_QUANTITY
-      value:
-        code: INVALID_QUANTITY
-        message: quantityKwh must be greater than 0 (max. 3 decimal places).
-    INVALID_PRICE:
-      summary: 400 INVALID_PRICE
-      value:
-        code: INVALID_PRICE
-        message: The price must be between 0 and 100 EUR/kWh (max. 5 decimal places).
-    UNAUTHORIZED:
-      summary: 401 UNAUTHORIZED
-      value:
-        code: UNAUTHORIZED
-        message: API key or token is missing, invalid or expired.
-    INVALID_CREDENTIALS:
-      summary: 401 INVALID_CREDENTIALS
-      value:
-        code: INVALID_CREDENTIALS
-        message: Email or password is wrong.
-    FORBIDDEN:
-      summary: 403 FORBIDDEN
-      value:
-        code: FORBIDDEN
-        message: You are not allowed to access this resource or perform this action.
-    FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
-      summary: 403 FORBIDDEN (fremde energyCommunityId)
-      value:
-        code: FORBIDDEN
-        message: energyCommunityId does not belong to the authenticated energy community.
-    ENERGY_COMMUNITY_NOT_ACTIVE:
-      summary: 403 ENERGY_COMMUNITY_NOT_ACTIVE
-      value:
-        code: ENERGY_COMMUNITY_NOT_ACTIVE
-        message: The energy community is not active (pending approval or suspended).
-    ENERGY_COMMUNITY_NOT_FOUND:
-      summary: 404 ENERGY_COMMUNITY_NOT_FOUND
-      value:
-        code: ENERGY_COMMUNITY_NOT_FOUND
-        message: The energy community does not exist.
-    POSITION_NOT_FOUND:
-      summary: 404 POSITION_NOT_FOUND
-      value:
-        code: POSITION_NOT_FOUND
-        message: The position does not exist.
-    MARKET_NOT_FOUND:
-      summary: 404 MARKET_NOT_FOUND
-      value:
-        code: MARKET_NOT_FOUND
-        message: No market exists for the delivery date.
+        code: COMMUNITY_CODE_ALREADY_REGISTERED
+        message: This communityCode is already registered.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
     EMAIL_ALREADY_REGISTERED:
       summary: 409 EMAIL_ALREADY_REGISTERED
       value:
         code: EMAIL_ALREADY_REGISTERED
         message: An energy community with this email is already registered.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
     ENERGY_COMMUNITY_IN_USE:
       summary: 409 ENERGY_COMMUNITY_IN_USE
       value:
         code: ENERGY_COMMUNITY_IN_USE
         message: The energy community cannot be deleted because it has positions or trades.
-    INVALID_STATUS_TRANSITION:
-      summary: 409 INVALID_STATUS_TRANSITION
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    ENERGY_COMMUNITY_NOT_ACTIVE:
+      summary: 403 ENERGY_COMMUNITY_NOT_ACTIVE
       value:
-        code: INVALID_STATUS_TRANSITION
-        message: This status change is not allowed.
-    POSITION_ALREADY_EXISTS:
-      summary: 409 POSITION_ALREADY_EXISTS
+        code: ENERGY_COMMUNITY_NOT_ACTIVE
+        message: The energy community is not active (pending approval or suspended).
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    ENERGY_COMMUNITY_NOT_FOUND:
+      summary: 404 ENERGY_COMMUNITY_NOT_FOUND
       value:
-        code: POSITION_ALREADY_EXISTS
-        message: A position already exists for this energy community, delivery date and interval.
-    POSITION_NOT_MODIFIABLE:
-      summary: 409 POSITION_NOT_MODIFIABLE
+        code: ENERGY_COMMUNITY_NOT_FOUND
+        message: The energy community does not exist.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    FORBIDDEN:
+      summary: 403 FORBIDDEN
       value:
-        code: POSITION_NOT_MODIFIABLE
-        message: The position is cancelled or already processed and can no longer be changed.
-    MARKET_CLOSED:
-      summary: 409 MARKET_CLOSED
+        code: FORBIDDEN
+        message: You are not allowed to access this resource or perform this action.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    FORBIDDEN_FOREIGN_ENERGY_COMMUNITY:
+      summary: 403 FORBIDDEN (fremde energyCommunityId)
       value:
-        code: MARKET_CLOSED
-        message: The market is already closed.
-    MARKET_NOT_SETTLED:
-      summary: 409 MARKET_NOT_SETTLED
+        code: FORBIDDEN
+        message: energyCommunityId does not belong to the authenticated energy community.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    IDEMPOTENCY_KEY_REUSED:
+      summary: 409 IDEMPOTENCY_KEY_REUSED
       value:
-        code: MARKET_NOT_SETTLED
-        message: The market result is not available yet.
-    DELIVERY_DATE_IN_PAST:
-      summary: 422 DELIVERY_DATE_IN_PAST
-      value:
-        code: DELIVERY_DATE_IN_PAST
-        message: The delivery date is in the past.
+        code: IDEMPOTENCY_KEY_REUSED
+        message: The Idempotency-Key was already used with a different request.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
     INTERNAL_ERROR:
       summary: 500 INTERNAL_ERROR
       value:
         code: INTERNAL_ERROR
         message: Internal error.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_CREDENTIALS:
+      summary: 401 INVALID_CREDENTIALS
+      value:
+        code: INVALID_CREDENTIALS
+        message: Email or password is wrong.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_DELIVERY_DATE:
+      summary: 400 INVALID_DELIVERY_DATE
+      value:
+        code: INVALID_DELIVERY_DATE
+        message: deliveryDate must be in the format YYYY-MM-DD.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_ID:
+      summary: 400 INVALID_ID
+      value:
+        code: INVALID_ID
+        message: The ID is not a valid UUID.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_INTERVAL:
+      summary: 400 INVALID_INTERVAL
+      value:
+        code: INVALID_INTERVAL
+        message: intervalStart is missing, not allowed or not a quarter hour of the delivery day.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_POSITION_TYPE:
+      summary: 400 INVALID_POSITION_TYPE
+      value:
+        code: INVALID_POSITION_TYPE
+        message: type must be OFFER or DEMAND.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_PRICE:
+      summary: 400 INVALID_PRICE
+      value:
+        code: INVALID_PRICE
+        message: The price must be between 0 and 100 EUR/kWh (max. 5 decimal places).
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_QUANTITY:
+      summary: 400 INVALID_QUANTITY
+      value:
+        code: INVALID_QUANTITY
+        message: quantityKwh must be greater than 0 (max. 3 decimal places).
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    INVALID_STATUS_TRANSITION:
+      summary: 409 INVALID_STATUS_TRANSITION
+      value:
+        code: INVALID_STATUS_TRANSITION
+        message: This status change is not allowed.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    MARKET_CLOSED:
+      summary: 409 MARKET_CLOSED
+      value:
+        code: MARKET_CLOSED
+        message: The market is already closed.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    MARKET_NOT_FOUND:
+      summary: 404 MARKET_NOT_FOUND
+      value:
+        code: MARKET_NOT_FOUND
+        message: No market exists for the delivery date.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    MARKET_NOT_SETTLED:
+      summary: 409 MARKET_NOT_SETTLED
+      value:
+        code: MARKET_NOT_SETTLED
+        message: The market result is not available yet.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    POSITION_ALREADY_EXISTS:
+      summary: 409 POSITION_ALREADY_EXISTS
+      value:
+        code: POSITION_ALREADY_EXISTS
+        message: A position already exists for this energy community, delivery date and interval.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    POSITION_NOT_FOUND:
+      summary: 404 POSITION_NOT_FOUND
+      value:
+        code: POSITION_NOT_FOUND
+        message: The position does not exist.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    POSITION_NOT_MODIFIABLE:
+      summary: 409 POSITION_NOT_MODIFIABLE
+      value:
+        code: POSITION_NOT_MODIFIABLE
+        message: The position is no longer OPEN and can no longer be changed.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    RATE_LIMITED:
+      summary: 429 RATE_LIMITED
+      value:
+        code: RATE_LIMITED
+        message: Too many requests. Retry after the time given in Retry-After.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    UNAUTHORIZED:
+      summary: 401 UNAUTHORIZED
+      value:
+        code: UNAUTHORIZED
+        message: API key or token is missing, invalid or expired.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+    VALIDATION_FAILED:
+      summary: 400 VALIDATION_FAILED
+      value:
+        code: VALIDATION_FAILED
+        message: At least one field is invalid.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+        details:
+        - field: /quantityKwh
+          code: INVALID_QUANTITY
+          message: quantityKwh must be greater than 0.
+    VALIDATION_FAILED_IDEMPOTENCY_KEY:
+      summary: 400 VALIDATION_FAILED (Idempotency-Key fehlt)
+      value:
+        code: VALIDATION_FAILED
+        message: At least one field is invalid.
+        requestId: 5c0e8a52-3b1d-4f6e-9a27-d84c1b7e6f30
+        details:
+        - field: header:Idempotency-Key
+          code: VALIDATION_FAILED
+          message: Idempotency-Key is required and must be a UUID.
+  headers:
+    X-Request-Id:
+      description: Request-ID dieser Anfrage (vom Client übernommen oder vom Server erzeugt).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    Api-Version:
+      description: Version des Datenvertrags, die der Server umsetzt.
+      schema:
+        type: string
+        examples:
+        - 0.3.1
+    Retry-After:
+      description: Wartezeit in Sekunden bis zum nächsten Versuch.
+      schema:
+        type: integer
+        minimum: 1

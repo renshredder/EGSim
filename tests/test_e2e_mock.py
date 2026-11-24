@@ -22,6 +22,16 @@ FLOWS = [
 ]
 
 
+def operator_closes(monkeypatch, platform):
+    """Betreiber schließt den Markt genau dann, wenn der Simulator auf das Settlement wartet (statt fester Timer)."""
+    orig = Simulator._wait_for_settlement
+
+    def wait(self, run, reader):
+        platform.close_market(run.delivery_date)
+        return orig(self, run, reader)
+    monkeypatch.setattr(Simulator, "_wait_for_settlement", wait)
+
+
 def _setup(platform, resolution="DAY", closes_in=timedelta(hours=1), n=4, auth="apiKey", **run):
     d = resolve_delivery_date("tomorrow").isoformat()
     platform.add_market(d, resolution, closes_at=now_utc() + closes_in)
@@ -39,13 +49,13 @@ def _setup(platform, resolution="DAY", closes_in=timedelta(hours=1), n=4, auth="
 
 
 @pytest.mark.parametrize("resolution", ["DAY", "QUARTER_HOUR"])
-def test_korrekte_plattform_ohne_befunde(resolution):
+def test_korrekte_plattform_ohne_befunde(resolution, monkeypatch):
     p = MockPlatform()
     srv, raw, d = _setup(p, resolution, allParticipantsSimulated=True)
     try:
         # Betreiber schließt den Markt, während der Simulator wartet
         raw_cfg = parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})
-        threading.Timer(3, p.close_market, args=(d,)).start()
+        operator_closes(monkeypatch, p)
         rep = Simulator(raw_cfg).run()
     finally:
         srv.shutdown()
@@ -104,11 +114,11 @@ class KaputtePlattform(MockPlatform):
                 break
 
 
-def test_kaputte_plattform_wird_erkannt():
+def test_kaputte_plattform_wird_erkannt(monkeypatch):
     p = KaputtePlattform()
     srv, raw, d = _setup(p)
     try:
-        threading.Timer(2, p.close_market, args=(d,)).start()
+        operator_closes(monkeypatch, p)
         rep = Simulator(parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})).run()
     finally:
         srv.shutdown()
@@ -182,10 +192,11 @@ def test_automatische_einrichtung_admin_checks_und_volle_pruefung():
     assert rep["markets"][0]["verification"]["status"] == "OK"
 
 
-def test_alle_szenarien_bestehen_gegen_mock():
+@pytest.mark.parametrize("rule", ["invariants", "gruppe1"])
+def test_alle_szenarien_bestehen_gegen_mock(rule):
     from egsim.scenarios import CATALOG
     p = MockPlatform()
-    srv, raw, d = _admin_setup(p, scenarios=[s.id for s in CATALOG])
+    srv, raw, d = _admin_setup(p, scenarios=[s.id for s in CATALOG], allocationRule=rule)
     raw["communities"] = []
     try:
         rep = Simulator(parse_config(raw)).run_scenarios()
@@ -197,11 +208,11 @@ def test_alle_szenarien_bestehen_gegen_mock():
     assert rep["totals"]["errors"] == 0
 
 
-def test_szenarien_im_tagesmarkt_und_ohne_admin():
+def test_szenarien_im_tagesmarkt_und_ohne_admin(monkeypatch):
     p = MockPlatform()
     srv, raw, d = _setup(p, "DAY", n=3, scenarios=["SZ-05", "SZ-01", "SZ-12"], waitForSettlementMinutes=1)
     try:
-        threading.Timer(3, p.close_market, args=(d,)).start()
+        operator_closes(monkeypatch, p)
         rep = Simulator(parse_config(raw)).run_scenarios()
     finally:
         srv.shutdown()
@@ -227,7 +238,7 @@ class FalscherRest(MockPlatform):
 
 def test_szenario_erkennt_falschen_rundungsrest():
     p = FalscherRest()
-    srv, raw, d = _admin_setup(p, scenarios=["SZ-04", "SZ-01"])
+    srv, raw, d = _admin_setup(p, scenarios=["SZ-04", "SZ-01"], allocationRule="gruppe1")
     raw["communities"] = []
     try:
         rep = Simulator(parse_config(raw)).run_scenarios()

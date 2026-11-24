@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -37,6 +38,13 @@ class ApiResponse:
     elapsed_ms: float
     error: str | None = None  # Transportfehler (Timeout, Verbindung)
     content_type: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)  # kleingeschriebene Namen
+    request_id: str | None = None          # mitgeschickte X-Request-Id
+    idempotency_key: str | None = None     # mitgeschickter Idempotency-Key
+
+    @property
+    def response_request_id(self) -> str | None:
+        return self.headers.get("x-request-id")
 
     @property
     def ok(self) -> bool:
@@ -145,8 +153,10 @@ class ApiClient:
         api_key: str | None = None,
         token: str | None = None,
         label: str = "",
+        retry_on_429: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.retry_on_429 = retry_on_429
         self.stats = stats
         self.timeout = timeout
         self.verify_tls = verify_tls
@@ -159,6 +169,7 @@ class ApiClient:
         return ApiClient(
             self.base_url, stats=self.stats, timeout=self.timeout, verify_tls=self.verify_tls,
             api_key=api_key, token=token, label=label if label is not None else self.label,
+            retry_on_429=self.retry_on_429,
         )
 
     # ------------------------------------------------------------------ core
@@ -173,9 +184,17 @@ class ApiClient:
         params: dict[str, Any] | None = None,
         auth: bool = True,
         headers: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+        request_id: str | None = None,
+        _retry: bool = True,
     ) -> ApiResponse:
         path = template.format(**(path_params or {}))
-        h = {"Accept": "application/json"}
+        # Vertrag ab 0.3: Clients dürfen X-Request-Id schicken; EGSim tut das immer, damit Requests im Log der
+        # Plattform wiederzufinden sind und das Echo geprüft werden kann
+        request_id = request_id or f"egsim-{uuid.uuid4()}"
+        h = {"Accept": "application/json", "X-Request-Id": request_id}
+        if idempotency_key:
+            h["Idempotency-Key"] = idempotency_key
         if auth:
             if self.api_key:
                 h["X-API-Key"] = self.api_key
@@ -183,6 +202,7 @@ class ApiClient:
                 h["Authorization"] = f"Bearer {self.token}"
         if headers:
             h.update(headers)
+            h = {k: v for k, v in h.items() if v is not None}  # None entfernt einen Header (Negativtests)
         data = None
         if raw_body is not None:
             data = raw_body.encode()
@@ -201,9 +221,10 @@ class ApiClient:
         except requests.RequestException as exc:
             ms = (time.perf_counter() - t0) * 1000
             self.stats.record(method, template, 0, ms)
-            self._detail(method, path, clean_params, json_body, raw_body, 0, None, ms, str(exc))
+            self._detail(method, path, clean_params, json_body, raw_body, 0, None, ms, str(exc), h)
             log.warning("[%s] %s %s -> Transportfehler: %s", self.label, method, path, exc)
-            return ApiResponse(method, path, 0, None, ms, error=type(exc).__name__ + ": " + str(exc))
+            return ApiResponse(method, path, 0, None, ms, error=type(exc).__name__ + ": " + str(exc),
+                               request_id=h.get("X-Request-Id"), idempotency_key=h.get("Idempotency-Key"))
         ms = (time.perf_counter() - t0) * 1000
         body: Any = None
         if r.content:
@@ -211,16 +232,30 @@ class ApiClient:
                 body = json.loads(r.content, parse_float=Decimal)
             except ValueError:
                 body = r.text
+        resp_headers = {k.lower(): v for k, v in r.headers.items()}
         self.stats.record(method, template, r.status_code, ms)
-        self._detail(method, path, clean_params, json_body, raw_body, r.status_code, body, ms, None)
+        self._detail(method, path, clean_params, json_body, raw_body, r.status_code, body, ms, None, h, resp_headers)
         log.debug("[%s] %s %s -> %s (%.0f ms)", self.label, method, path, r.status_code, ms)
         if self.stats.validate_contract and not template.startswith("/_mock"):
             issues = contract.check_response(method, template, r.status_code, body, r.headers.get("Content-Type"))
+            issues += contract.check_headers(method, template, r.status_code, resp_headers, body, h.get("X-Request-Id"))
             if issues:
                 self.stats.record_contract(method, template, r.status_code, issues, f"{method} {path} -> {r.status_code}")
-        return ApiResponse(method, path, r.status_code, body, ms, content_type=r.headers.get("Content-Type"))
+        resp = ApiResponse(method, path, r.status_code, body, ms, content_type=r.headers.get("Content-Type"),
+                           headers=resp_headers, request_id=h.get("X-Request-Id"),
+                           idempotency_key=h.get("Idempotency-Key"))
+        if r.status_code == 429 and self.retry_on_429 and _retry:
+            wait = resp_headers.get("retry-after", "")
+            if wait.isdigit() and int(wait) <= 10:  # kurz warten und genau einmal wiederholen
+                log.info("[%s] 429 – warte %s s und wiederhole %s %s", self.label, wait, method, path)
+                time.sleep(int(wait))
+                return self.call(method, template, path_params=path_params, json_body=json_body, raw_body=raw_body,
+                                 params=params, auth=auth, headers=headers, idempotency_key=idempotency_key,
+                                 _retry=False)
+        return resp
 
-    def _detail(self, method, path, params, json_body, raw_body, status, body, ms, error) -> None:
+    def _detail(self, method, path, params, json_body, raw_body, status, body, ms, error, req_headers=None,
+                resp_headers=None) -> None:
         req = _to_jsonable(json_body) if json_body is not None else raw_body
         if isinstance(req, dict) and "password" in req:
             req = {**req, "password": "***"}
@@ -233,7 +268,10 @@ class ApiClient:
         self.stats.record_detail({
             "time": time.strftime("%H:%M:%S"), "actor": self.label, "method": method, "path": path,
             "query": params or None, "status": status, "ms": round(ms, 1), "request": req, "response": resp,
-            "error": error,
+            "error": error, "requestId": (req_headers or {}).get("X-Request-Id"),
+            "idempotencyKey": (req_headers or {}).get("Idempotency-Key"),
+            "responseHeaders": {k: v for k, v in (resp_headers or {}).items()
+                                if k in ("x-request-id", "api-version", "retry-after")} or None,
         })
 
     # -------------------------------------------------------------- endpoints
@@ -249,11 +287,15 @@ class ApiClient:
     def me(self) -> ApiResponse:
         return self.call("GET", "/me")
 
-    def register(self, email: str, name: str, description: str | None = None) -> ApiResponse:
-        body = {"email": email, "name": name}
+    def register(self, email: str, community_code: str | None, name: str, description: str | None = None, *,
+                 idempotency_key: str | None = None) -> ApiResponse:
+        body: dict = {"email": email}
+        if community_code is not None:
+            body["communityCode"] = community_code
+        body["name"] = name
         if description:
             body["description"] = description
-        return self.call("POST", "/energy-communities", json_body=body, auth=False)
+        return self.call("POST", "/energy-communities", json_body=body, auth=False, idempotency_key=idempotency_key)
 
     def list_communities(self, status: str | None = None) -> ApiResponse:
         return self.call("GET", "/energy-communities", params={"status": status})
@@ -273,8 +315,10 @@ class ApiClient:
     def issue_credentials(self, ec_id: str) -> ApiResponse:
         return self.call("POST", "/energy-communities/{id}/credentials", path_params={"id": ec_id})
 
-    def submit_position(self, body: dict) -> ApiResponse:
-        return self.call("POST", "/positions", json_body=body)
+    def submit_position(self, body: dict, idempotency_key: str | None = None) -> ApiResponse:
+        """Vertrag ab 0.3: Idempotency-Key ist Pflicht. Ohne Angabe wird ein neuer erzeugt (neuer fachlicher Vorgang);
+        für eine Wiederholung den Key aus ApiResponse.idempotency_key erneut übergeben."""
+        return self.call("POST", "/positions", json_body=body, idempotency_key=idempotency_key or str(uuid.uuid4()))
 
     def list_positions(self, **params: Any) -> ApiResponse:
         return self.call("GET", "/positions", params=params)
@@ -287,6 +331,9 @@ class ApiClient:
 
     def cancel_position(self, pos_id: str) -> ApiResponse:
         return self.call("DELETE", "/positions/{id}", path_params={"id": pos_id})
+
+    def list_markets(self, status: str | None = None) -> ApiResponse:
+        return self.call("GET", "/markets", params={"status": status})
 
     def get_market(self, d: str) -> ApiResponse:
         return self.call("GET", "/markets/{deliveryDate}", path_params={"deliveryDate": d})

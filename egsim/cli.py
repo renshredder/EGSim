@@ -141,6 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--settlement-delay", type=float, default=0)
     m.add_argument("--demo-egs", type=int, default=0, help="N aktive Demo-EGs anlegen und Zugangsdaten ausgeben")
     m.add_argument("--auto-settle", action="store_true", help="Märkte nach closesAt automatisch schließen")
+    m.add_argument("--login-rate-limit", type=int, default=10,
+                   help="Login-Fehlversuche je E-Mail bis 429 RATE_LIMITED (0 = aus)")
     m.set_defaults(func=cmd_mock)
     return p
 

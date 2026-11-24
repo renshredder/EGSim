@@ -1,28 +1,34 @@
-"""Prüft nach dem Settlement die Zuteilungen und Handelsabschlüsse aus Sicht der simulierten EGs.
+"""Ergebnisprüfung nach dem Settlement (Datenvertrag 0.3.1).
 
-Ohne Admin-Zugang sieht jede EG nur ihre eigenen Daten. Geprüft wird deshalb:
-- Mandantentrennung (nur eigene Datensätze), Positionsstatus nach Settlement
-- je Position: Zuteilung vorhanden und plausibel (Menge, reason), Trades passen zur Zuteilung, Preise, Beträge
-- über alle simulierten EGs hinweg: Teilzuteilungs-Anteil gleich, keine Reserve bei Überangebot usw.
-- Option „nur simulierte EGs am Markt“: vollständige Nachrechnung mit der Referenzlogik
-  (gelieferte Reserve = Summe der Reserve-Trades, weil /result nur der Admin sehen darf)
+Seit 0.3 legt jede Plattform ihre Preis- und Zuteilungsregel selbst fest. Verbindlich sind nur die Invarianten aus
+dem Abschnitt „Handelslogik“. Geprüft wird deshalb in Stufen:
+
+1. **EG-Sicht** (immer): Mandantentrennung, Positionsstatus, je Position genau eine Zuteilung, Menge und `reason`
+   passen zusammen, Trades ergeben die Zuteilung, Beträge = Menge × Preis (kaufmännisch gerundet), keine 0-kWh-Trades,
+   und was sich über die simulierten EGs hinweg schon folgern lässt (Überangebot ↔ Reserve schließen sich aus).
+2. **Invarianten über den ganzen Markt**, wenn EGSim alle Positionen kennt (Admin-Key oder „Nur simulierte EGs am
+   Markt“): Ankauf = min(S, D), Reserve = max(D − S, 0), Summen, Bedarfe gedeckt bzw. RESERVE_SHORTAGE.
+   Mit Admin-Key zusätzlich das Tagesergebnis /result: Summen, Reserve, Beträge, Marge, Durchschnittspreise.
+3. **Referenzregel Gruppe 1** (Option `allocationRule = gruppe1`): exakte Nachrechnung mit festen Preisen,
+   pro rata und Rundungsrest nach createdAt.
 """
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any
 
-from egsim.settlement import STEP, ZERO, D, Pos, Prices, round_eur, settle
+from egsim.settlement import STEP, ZERO, D, Pos, Prices, reserve_status, round_eur, settle
 from egsim.timeutil import normalize_interval, parse_ts
 
 if TYPE_CHECKING:
     from egsim.simulator import MarketRun, Simulator
 
 log = logging.getLogger("egsim.verify")
-OFFER_REASONS = {"FULLY_ALLOCATED", "PARTIALLY_ALLOCATED", "PRICE_NOT_MET", "NOT_NEEDED"}
+OFFER_REASONS = {"FULLY_ALLOCATED", "PARTIALLY_ALLOCATED", "NOT_ALLOCATED", "NOT_NEEDED"}
 DEMAND_REASONS = {"FULLY_ALLOCATED", "RESERVE_SHORTAGE"}
+PRICE_STEP = Decimal("0.00001")
 
 
 class Diff:
@@ -77,6 +83,13 @@ def _decimals(v) -> int:
     return -exp if isinstance(exp, int) and exp < 0 else 0
 
 
+def _q(v) -> Decimal:
+    try:
+        return D(v) if v is not None and not isinstance(v, bool) else ZERO
+    except ArithmeticError:
+        return ZERO
+
+
 def _check_rejection_reason(diff: Diff, where: str, p: dict) -> None:
     """rejectionReason ist nur bei REJECTED gesetzt, und zwar mit dem Grund ENERGY_COMMUNITY_NOT_ACTIVE."""
     reason = p.get("rejectionReason")
@@ -88,8 +101,8 @@ def _check_rejection_reason(diff: Diff, where: str, p: dict) -> None:
 
 
 def _check_market_state(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict | None:
-    """Marktzustand nach dem Settlement: Zeitstempel gesetzt, kein failureReason, Preise und Auflösung unverändert."""
-    reader = sim.reader()
+    """Marktzustand nach dem Settlement: Zeitstempel gesetzt, kein failureReason, Auflösung unverändert."""
+    reader = sim.reader() or sim.admin
     if reader is None:
         return None
     r = reader.get_market(run.delivery_date)
@@ -107,28 +120,26 @@ def _check_market_state(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict 
             diff.true(w, parse_ts(fin["closedAt"]) <= parse_ts(fin["settledAt"]), "closedAt liegt nach settledAt")
     except (TypeError, ValueError, AttributeError):
         pass  # ungültige Zeitstempel meldet die Schema-Prüfung
-    if start.get("resolution") is not None:
+    if start.get("resolution") is not None:  # Vertrag 0.3: Auflösung bleibt ab Marktöffnung unverändert
         diff.eq(w, "resolution", start.get("resolution"), fin.get("resolution"))
-    try:  # der Vertrag erklärt nur Preise und Auflösung für fest, die Frist darf der Betreiber verschieben: nur Hinweis
-        if start.get("closesAt") and fin.get("closesAt") and parse_ts(start["closesAt"]) != parse_ts(fin["closesAt"]):
-            sim.findings.warning("verify", f"{run.delivery_date}: closesAt hat sich seit dem Start geändert "
-                                           f"({start['closesAt']} → {fin['closesAt']})")
-    except (TypeError, ValueError, AttributeError):
-        pass
     sp, fp = start.get("prices") or {}, fin.get("prices") or {}
-    for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
-        if f in sp:
-            diff.num(w, f"prices.{f} (bleibt bis zum Settlement unverändert)", sp.get(f), fp.get(f))
+    changed = [f for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh")
+               if f in sp and _q(sp.get(f)) != _q(fp.get(f))]
+    if changed:  # nur eine Indikation (Vertrag 0.3), darf sich ändern
+        sim.findings.info("verify", f"{run.delivery_date}: Preisindikation hat sich seit dem Start geändert "
+                                    f"({', '.join(changed)}) – zulässig, verbindlich sind die Trade-Preise")
     return fin
 
 
+# ======================================================================================================================
 def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
     d = run.delivery_date
     diff = Diff(sim, d)
     tol_k, tol_e = sim.cfg.tolerance_kwh, sim.cfg.tolerance_eur
+    gruppe1 = sim.cfg.allocation_rule == "gruppe1"
     market = run.market or {}
     resolution = market.get("resolution")
-    prices = Prices.from_api(market.get("prices") or {})
+    indication = Prices.from_api(market.get("prices") or {}) if market.get("prices") else None
     iv_key = (lambda x: normalize_interval(x)) if resolution == "QUARTER_HOUR" else (lambda x: None)
 
     all_pos: list[dict] = []
@@ -137,6 +148,7 @@ def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
     by_status: dict[str, int] = defaultdict(int)
     tracked = {sp.id: sp for sp in run.positions if sp.id}
     diff.market_final = _check_market_state(sim, run, diff)
+    off_indication = 0
 
     for eg in sim.egs:
         if not eg.ready:
@@ -179,24 +191,29 @@ def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
             trades_by_pos[t.get("positionId")].append(t)
             q, pr, amt = D(t.get("quantityKwh")), D(t.get("priceEurPerKwh")), D(t.get("amountEur"))
             diff.true(w, q is not None and q > 0, "quantityKwh <= 0 (Mengen von 0 kWh erzeugen keinen Trade)")
-            if None not in (q, pr, amt):
+            if None not in (q, pr, amt):  # Invariante 7
                 diff.true(w, abs(round_eur(q * pr) - amt) <= tol_e,
                           f"amountEur {amt} ≠ round(quantityKwh × priceEurPerKwh) = {round_eur(q * pr)}")
                 diff.true(w, _decimals(amt) <= 2, f"amountEur {amt} hat mehr als 2 Nachkommastellen")
             diff.eq(w, "deliveryDate", d, t.get("deliveryDate"))
-            if t.get("direction") == "PLATFORM_BUYS":
+            direction = t.get("direction")
+            if direction not in ("PLATFORM_BUYS", "PLATFORM_SELLS"):
+                diff.fail(w, f"direction {direction} unbekannt")
+                continue
+            if direction == "PLATFORM_BUYS":
                 diff.true(w, not t.get("fromReserve"), "fromReserve=true bei PLATFORM_BUYS")
-                diff.num(w, "priceEurPerKwh (Ankauf)", prices.buy, pr)
-            elif t.get("direction") == "PLATFORM_SELLS":
-                diff.num(w, "priceEurPerKwh (Verkauf)", prices.sell, pr)
-            else:
-                diff.fail(w, f"direction {t.get('direction')} unbekannt")
+            ref_price = (indication.buy if direction == "PLATFORM_BUYS" else indication.sell) if indication else None
+            if gruppe1 and ref_price is not None:  # Gruppe 1: feste Preise, die ab Öffnung in Market.prices stehen
+                diff.num(w, f"priceEurPerKwh ({'Ankauf' if direction == 'PLATFORM_BUYS' else 'Verkauf'}, Gruppe 1)",
+                         ref_price, pr)
+            elif ref_price is not None and pr is not None and pr != ref_price:
+                off_indication += 1
 
         for pid, p in own.items():
             w = f"{who} Position {pid} ({p.get('type')})"
             al = alloc_by_pos.get(pid, [])
             tr = trades_by_pos.get(pid, [])
-            if p.get("status") != "PROCESSED":
+            if p.get("status") != "PROCESSED":  # Invariante 1: nur CLOSED/PROCESSED zählt
                 diff.true(w, not al and not tr, f"Status {p.get('status')}, hat aber Zuteilung/Trades")
                 continue
             if len(al) != 1:
@@ -214,134 +231,204 @@ def verify_market(sim: "Simulator", run: "MarketRun") -> dict:
             if got is None:
                 diff.fail(w, "allocatedKwh fehlt")
                 continue
-            diff.true(w, ZERO <= got <= req, f"allocatedKwh {got} außerhalb 0…{req}")
+            diff.true(w, ZERO <= got <= req, f"allocatedKwh {got} außerhalb 0…{req} (Invariante 2)")
             diff.true(w, _decimals(got) <= 3, f"allocatedKwh {got} hat mehr als 3 Nachkommastellen")
             reason = a.get("reason")
             if p.get("type") == "OFFER":
-                pe = D(p.get("priceExpectationEurPerKwh"))
-                too_high = pe is not None and (prices.buy is None or pe > prices.buy)
                 diff.true(w, reason in OFFER_REASONS, f"reason {reason} unzulässig für OFFER")
-                if too_high:
-                    diff.true(w, reason == "PRICE_NOT_MET" and got == 0,
-                              f"Preisvorstellung {pe} > Ankaufspreis {prices.buy}: erwartet PRICE_NOT_MET/0, "
-                              f"Plattform {reason}/{got}")
-                else:
-                    diff.true(w, reason != "PRICE_NOT_MET", f"PRICE_NOT_MET obwohl Preisvorstellung {pe} ≤ {prices.buy}")
                 if reason == "FULLY_ALLOCATED":
                     diff.true(w, got == req, f"FULLY_ALLOCATED, aber {got} von {req}")
                 elif reason == "PARTIALLY_ALLOCATED":
-                    diff.true(w, got < req, f"PARTIALLY_ALLOCATED, aber {got} von {req}")
-                elif reason == "NOT_NEEDED":
-                    diff.true(w, got == 0, f"NOT_NEEDED, aber {got} kWh")
+                    diff.true(w, ZERO < got < req, f"PARTIALLY_ALLOCATED, aber {got} von {req}")
+                elif reason in ("NOT_ALLOCATED", "NOT_NEEDED"):
+                    diff.true(w, got == 0, f"{reason}, aber {got} kWh")
+                wrong = [t for t in tr if t.get("direction") != "PLATFORM_BUYS"]
+                diff.true(w, not wrong, "OFFER hat PLATFORM_SELLS-Trades")
                 buys = [t for t in tr if t.get("direction") == "PLATFORM_BUYS"]
-                diff.true(w, len(buys) == len(tr), "OFFER hat PLATFORM_SELLS-Trades")
-                if got > 0:
-                    diff.true(w, len(buys) == 1, f"{len(buys)} PLATFORM_BUYS-Trades (erwartet 1)")
-                    if buys:
-                        diff.num(w, "Trade quantityKwh", got, buys[0].get("quantityKwh"), tol_k)
-                else:
-                    diff.true(w, not tr, "Trade trotz 0 kWh Zuteilung")
+                if gruppe1:
+                    diff.true(w, len(buys) == (1 if got > 0 else 0), f"{len(buys)} PLATFORM_BUYS-Trades (Gruppe 1: genau einer)")
             else:
                 diff.true(w, reason in DEMAND_REASONS, f"reason {reason} unzulässig für DEMAND")
                 if reason == "FULLY_ALLOCATED":
                     diff.true(w, got == req, f"FULLY_ALLOCATED, aber {got} von {req}")
                 elif reason == "RESERVE_SHORTAGE":
                     diff.true(w, got < req, f"RESERVE_SHORTAGE, aber {got} von {req}")
-                sells = [t for t in tr if t.get("direction") == "PLATFORM_SELLS"]
-                diff.true(w, len(sells) == len(tr), "DEMAND hat PLATFORM_BUYS-Trades")
-                diff.true(w, sum(1 for t in sells if not t.get("fromReserve")) <= 1
-                          and sum(1 for t in sells if t.get("fromReserve")) <= 1,
-                          "mehr als ein Trade je Anteil (Angebote/Reserve)")
-                total = sum((D(t.get("quantityKwh")) or ZERO for t in sells), ZERO)
-                diff.num(w, "Summe Trade-Mengen", got, total, tol_k)
+                wrong = [t for t in tr if t.get("direction") != "PLATFORM_SELLS"]
+                diff.true(w, not wrong, "DEMAND hat PLATFORM_BUYS-Trades")
+                if gruppe1:
+                    sells = [t for t in tr if t.get("direction") == "PLATFORM_SELLS"]
+                    diff.true(w, sum(1 for t in sells if not t.get("fromReserve")) <= 1
+                              and sum(1 for t in sells if t.get("fromReserve")) <= 1,
+                              "Gruppe 1: höchstens ein Trade je Anteil (Angebote/Reserve)")
+            # Handelsabschlüsse: mindestens einer bei Zuteilung > 0, keiner bei 0, Summe = Zuteilung
+            total = sum((_q(t.get("quantityKwh")) for t in tr), ZERO)
+            if got > 0:
+                diff.true(w, len(tr) >= 1, "Zuteilung > 0, aber kein Handelsabschluss")
+            else:
+                diff.true(w, not tr, "Handelsabschluss trotz 0 kWh Zuteilung")
+            diff.num(w, "Summe der Trade-Mengen = Zuteilung", got, total, tol_k)
 
-    # --- Konsistenz über alle simulierten EGs je Intervall
+    if off_indication:
+        sim.findings.info("verify", f"{d}: {off_indication} Trade-Preise weichen von der Preisindikation ab – zulässig "
+                                    "(verbindlich ist der Preis des Handelsabschlusses)")
+
+    # --- Folgerungen aus den Daten der simulierten EGs (gelten unabhängig von anderen Marktteilnehmern)
     groups: dict[Any, list[dict]] = defaultdict(list)
     for p in all_pos:
         groups[iv_key(p.get("intervalStart"))].append(p)
-    reserve_trades: dict[Any, Decimal] = defaultdict(lambda: ZERO)
+    reserve_used: dict[Any, Decimal] = defaultdict(lambda: ZERO)
     for t in all_trades:
         if t.get("fromReserve"):
-            reserve_trades[iv_key(t.get("intervalStart"))] += D(t.get("quantityKwh")) or ZERO
+            reserve_used[iv_key(t.get("intervalStart"))] += _q(t.get("quantityKwh"))
     for key, ps in groups.items():
         w = f"Intervall {key}" if key else "Tagesmarkt"
-        partial = [p for p in ps if all_alloc[p["id"]].get("reason") == "PARTIALLY_ALLOCATED"]
-        shortage = [p for p in ps if all_alloc[p["id"]].get("reason") == "RESERVE_SHORTAGE"]
-        if partial:
-            diff.true(w, reserve_trades[key] == 0 and not shortage,
-                      "Teilzuteilung von Angeboten (Überangebot) und gleichzeitig Reserve/Reserveknappheit")
+        reason = {p["id"]: all_alloc[p["id"]].get("reason") for p in ps}
+        offers = [p for p in ps if p.get("type") == "OFFER"]
+        demands = [p for p in ps if p.get("type") == "DEMAND"]
+        oversupply = [p for p in offers if reason[p["id"]] in ("PARTIALLY_ALLOCATED", "NOT_ALLOCATED")]
+        not_needed = [p for p in offers if reason[p["id"]] == "NOT_NEEDED"]
+        shortage = reserve_used[key] > 0 or any(reason[p["id"]] == "RESERVE_SHORTAGE" for p in demands)
+        if not_needed:  # NOT_NEEDED heißt: kein Bedarf im Intervall
+            diff.true(w, not demands, f"Angebot NOT_NEEDED (kein Bedarf), aber {len(demands)} simulierte Bedarfe im selben Intervall")
+            diff.true(w, len(not_needed) == len(offers), "Angebote teils NOT_NEEDED, teils gekauft")
+        if oversupply:  # Überangebot S > D: Ankauf = D, jeder Bedarf aus Angeboten gedeckt, keine Reserve (Inv. 3–5)
+            diff.true(w, not shortage, "Angebote nicht voll gekauft (Überangebot) und gleichzeitig Reserve/Reserveknappheit")
+            diff.true(w, all(reason[p["id"]] == "FULLY_ALLOCATED" for p in demands),
+                      "Überangebot, aber nicht jeder Bedarf voll gedeckt")
+        if shortage:  # D > S: jedes Angebot wird voll gekauft (Invariante 3 mit Invariante 2)
+            cut = [p for p in offers if reason[p["id"]] != "FULLY_ALLOCATED"]
+            diff.true(w, not cut, f"Reserve genutzt, aber {len(cut)} Angebote nicht voll gekauft (Ankauf muss min(S, D) = S sein)")
+        if gruppe1 and len(oversupply) > 0:
+            partial = [p for p in offers]
             ratios = [D(all_alloc[p["id"]]["allocatedKwh"]) / D(p["quantityKwh"]) for p in partial]
-            spread = max(ratios) - min(ratios)
             tolerance = max(STEP / D(p["quantityKwh"]) for p in partial) * 2
-            diff.true(w, spread <= tolerance, f"Teilzuteilung nicht pro rata (Anteile {min(ratios):.4f}…{max(ratios):.4f})")
-            full_tradable = [p for p in ps if p.get("type") == "OFFER"
-                             and all_alloc[p["id"]].get("reason") in ("FULLY_ALLOCATED", "NOT_NEEDED")]
-            diff.true(w, not full_tradable, "handelbare Angebote teils voll, teils anteilig zugeteilt")
-        if reserve_trades[key] > 0:
-            offers_cut = [p for p in ps if p.get("type") == "OFFER" and all_alloc[p["id"]].get("reason")
-                          in ("PARTIALLY_ALLOCATED", "NOT_NEEDED")]
-            diff.true(w, not offers_cut, "Reserve genutzt, aber handelbare Angebote nicht voll gekauft")
+            diff.true(w, max(ratios) - min(ratios) <= tolerance,
+                      f"Gruppe 1: Überangebot nicht pro rata (Anteile {min(ratios):.4f}…{max(ratios):.4f})")
 
-    # --- Optional: vollständige Nachrechnung, wenn nur simulierte EGs am Markt sind
+    # --- Markt vollständig bekannt: Invarianten über den ganzen Markt, Tagesergebnis, ggf. Gruppe 1
     full = None
     mode = "egView"
     if getattr(sim, "admin", None) is not None:
         full = verify_market_admin(sim, run, diff)
         mode = "admin" if full else mode
     elif sim.cfg.all_participants_simulated and all_pos:
-        full = _full_recalc(diff, d, resolution, prices, all_pos, all_alloc, all_trades, reserve_trades, tol_k, tol_e)
-        mode = "full" if full else mode
+        check_invariants(diff, "Markt", resolution, all_pos, all_alloc, all_trades, tol_k)
+        full = {"invariants": "geprüft"}
+        if gruppe1:
+            full = _gruppe1_recalc(sim, diff, "Gruppe 1", resolution, indication, all_pos, all_alloc, all_trades,
+                                   reserve_used, tol_k, tol_e) or full
+        mode = "full"
 
     summary = {
         "status": "OK" if diff.count == 0 else "MISMATCH",
         "mode": mode,
+        "rule": sim.cfg.allocation_rule,
         "comparisons": diff.compared,
         "mismatches": diff.count,
         "positionsByStatus": dict(by_status),
         "processedPositions": len(all_pos),
         "trades": len(all_trades),
-        "ownPurchaseEur": str(sum((D(t["amountEur"]) for t in all_trades if t.get("direction") == "PLATFORM_BUYS"), ZERO)),
-        "ownSalesEur": str(sum((D(t["amountEur"]) for t in all_trades if t.get("direction") == "PLATFORM_SELLS"), ZERO)),
+        "ownPurchaseEur": str(sum((_q(t.get("amountEur")) for t in all_trades if t.get("direction") == "PLATFORM_BUYS"), ZERO)),
+        "ownSalesEur": str(sum((_q(t.get("amountEur")) for t in all_trades if t.get("direction") == "PLATFORM_SELLS"), ZERO)),
         "reference": full,
     }
     log.info("Prüfung %s: %s (%d Vergleiche, %d Abweichungen)", d, summary["status"], diff.compared, diff.count)
     return summary
 
 
-def _full_recalc(diff: Diff, d, resolution, prices, all_pos, all_alloc, all_trades, reserve_trades, tol_k, tol_e) -> dict:
-    processed = [Pos.from_api(p) for p in all_pos]
-    dispatched = dict(reserve_trades) if resolution == "QUARTER_HOUR" else {None: reserve_trades.get(None, ZERO)}
-    ref = settle(processed, prices, resolution, dispatched)
-    for ra in ref.allocations:
-        pa = all_alloc.get(ra.position.id, {})
-        w = f"Nachrechnung Position {ra.position.id}"
-        diff.num(w, "allocatedKwh", ra.allocated, pa.get("allocatedKwh"), tol_k)
-        diff.eq(w, "reason", ra.reason, pa.get("reason"))
-    plat = {(t.get("positionId"), t.get("direction"), bool(t.get("fromReserve"))): t for t in all_trades}
-    diff.true(f"Nachrechnung {d}", len(plat) == len(all_trades), "doppelte Handelsabschlüsse")
-    refk = {(t.position.id, t.direction, t.from_reserve): t for t in ref.trades}
-    for k, rt in refk.items():
-        pt = plat.get(k)
-        w = f"Nachrechnung Trade {k[0]} {k[1]}{' (Reserve)' if k[2] else ''}"
-        if pt is None:
-            diff.fail(w, f"fehlt (erwartet {rt.quantity} kWh)")
-            continue
-        diff.num(w, "quantityKwh", rt.quantity, pt.get("quantityKwh"), tol_k)
-        diff.num(w, "amountEur", rt.amount, pt.get("amountEur"), tol_e)
-    for k in set(plat) - set(refk):
-        diff.fail(f"Nachrechnung Trade {k[0]} {k[1]}", f"unerwartet ({plat[k].get('quantityKwh')} kWh)")
-    return {
-        "totalOfferedKwh": str(ref.total_offered), "tradableOfferedKwh": str(ref.tradable_offered),
-        "totalDemandKwh": str(ref.total_demand), "reserveRequiredKwh": str(ref.reserve.required),
-        "reserveDispatchedKwh": str(ref.reserve.dispatched), "purchaseCostEur": str(ref.purchase_cost),
-        "salesRevenueEur": str(ref.sales_revenue), "reserveCostEur": str(ref.reserve.cost), "marginEur": str(ref.margin),
-    }
-
-
 # ======================================================================================================================
+def interval_figures(positions: list[dict], allocs: dict[str, dict], trades: list[dict]) -> dict[str, Decimal]:
+    S = sum((_q(p.get("quantityKwh")) for p in positions if p.get("type") == "OFFER"), ZERO)
+    Dm = sum((_q(p.get("quantityKwh")) for p in positions if p.get("type") == "DEMAND"), ZERO)
+    buys = sum((_q(t.get("quantityKwh")) for t in trades if t.get("direction") == "PLATFORM_BUYS"), ZERO)
+    sells = sum((_q(t.get("quantityKwh")) for t in trades if t.get("direction") == "PLATFORM_SELLS"), ZERO)
+    reserve = sum((_q(t.get("quantityKwh")) for t in trades if t.get("fromReserve")), ZERO)
+    sold_alloc = sum((_q(allocs[p["id"]].get("allocatedKwh")) for p in positions
+                      if p.get("type") == "DEMAND" and p["id"] in allocs), ZERO)
+    return {"S": S, "D": Dm, "buys": buys, "sells": sells, "reserve": reserve, "soldAlloc": sold_alloc,
+            "required": max(Dm - S, ZERO)}
+
+
+def check_invariants(diff: Diff, label: str, resolution: str | None, positions: list[dict], allocs: dict[str, dict],
+                     trades: list[dict], tol_k: Decimal = ZERO) -> dict[Any, dict[str, Decimal]]:
+    """Invarianten 3–6 je Intervall (bei DAY einmal), wenn alle PROCESSED-Positionen des Markts bekannt sind."""
+    key = (lambda x: normalize_interval(x)) if resolution == "QUARTER_HOUR" else (lambda x: None)
+    pos_by: dict[Any, list[dict]] = defaultdict(list)
+    tr_by: dict[Any, list[dict]] = defaultdict(list)
+    for p in positions:
+        pos_by[key(p.get("intervalStart"))].append(p)
+    for t in trades:
+        tr_by[key(t.get("intervalStart"))].append(t)
+    out = {}
+    for k in sorted(set(pos_by) | set(tr_by), key=lambda x: x or ""):
+        f = interval_figures(pos_by[k], allocs, tr_by[k])
+        out[k] = f
+        w = f"{label} {k}" if k else label
+        diff.num(w, "Ankauf = min(S, D) (Invariante 3)", min(f["S"], f["D"]), f["buys"], tol_k)
+        diff.true(w, f["reserve"] <= f["required"] + tol_k,
+                  f"Reserve {f['reserve']} kWh, nötig ist höchstens max(D − S, 0) = {f['required']} kWh (Invariante 4)")
+        if f["D"] == 0:
+            diff.true(w, f["buys"] == 0 and f["reserve"] == 0, "ohne Nachfrage weder Ankauf noch Reserve (Invariante 4)")
+        diff.num(w, "verkauft = Ankauf + Reserve", f["buys"] + f["reserve"], f["sells"], tol_k)
+        diff.num(w, "Summe Verkäufe = Summe Zuteilungen der Bedarfe (Invariante 6)", f["soldAlloc"], f["sells"], tol_k)
+        demands = [p for p in pos_by[k] if p.get("type") == "DEMAND"]
+        if f["reserve"] >= f["required"]:  # Standardfall: jeder Bedarf voll gedeckt (Invariante 5)
+            short = [p for p in demands if allocs.get(p["id"], {}).get("reason") != "FULLY_ALLOCATED"]
+            diff.true(w, not short, f"Reserve reicht, aber {len(short)} Bedarfe nicht voll gedeckt (Invariante 5)")
+        else:
+            full = [p for p in demands if allocs.get(p["id"], {}).get("reason") == "FULLY_ALLOCATED"]
+            if full and len(full) == len(demands):
+                diff.fail(w, "Reserve fehlt, trotzdem alle Bedarfe FULLY_ALLOCATED (Invariante 5)")
+    return out
+
+
+def _reserve_expect(required: Decimal, dispatched: Decimal) -> str:
+    return reserve_status(required, min(dispatched, required) if required > 0 else ZERO)
+
+
+def _avg(trades: list[dict]) -> Decimal | None:
+    qty = sum((_q(t.get("quantityKwh")) for t in trades), ZERO)
+    if qty == 0:
+        return None
+    return sum((_q(t.get("quantityKwh")) * _q(t.get("priceEurPerKwh")) for t in trades), ZERO) / qty
+
+
+def _cmp_price(diff: Diff, w: str, field: str, expected: Decimal | None, actual) -> None:
+    """Durchschnittspreis: null genau dann, wenn es kein Geschäft gab; sonst bis auf Rundung auf 5 Stellen gleich."""
+    if expected is None:
+        diff.true(w, actual is None, f"{field}: ohne Geschäft in dieser Richtung muss der Preis null sein, ist {actual}")
+        return
+    exp5 = expected.quantize(PRICE_STEP, rounding=ROUND_HALF_UP)
+    diff.num(w, f"{field} (Durchschnitt gewichtet nach Menge)", exp5, actual, PRICE_STEP)
+
+
+def _cmp_result_block(diff: Diff, w: str, figures: dict[str, Decimal], block: dict, trades: list[dict], tol_k, tol_e,
+                      top_level: bool) -> None:
+    """Summen und Reserve eines Tages- bzw. Intervallergebnisses gegen Positionen und Trades."""
+    diff.num(w, "totalOfferedKwh = S", figures["S"], block.get("totalOfferedKwh"), tol_k)
+    diff.num(w, "totalDemandKwh = D", figures["D"], block.get("totalDemandKwh"), tol_k)
+    diff.num(w, "totalPurchasedKwh = Summe PLATFORM_BUYS (Invariante 6)", figures["buys"], block.get("totalPurchasedKwh"), tol_k)
+    diff.num(w, "totalSoldKwh = Summe PLATFORM_SELLS (Invariante 6)", figures["sells"], block.get("totalSoldKwh"), tol_k)
+    res = block.get("reserve") or {}
+    diff.num(w, "reserve.requiredKwh = max(D − S, 0)" + ("" if not top_level else " (bei QUARTER_HOUR Summe der Intervalle)"),
+             figures["required"], res.get("requiredKwh"), tol_k)
+    disp = _q(res.get("dispatchedKwh"))
+    diff.true(w, disp <= figures["required"] + tol_k, f"reserve.dispatchedKwh {disp} > requiredKwh {figures['required']}")
+    diff.num(w, "reserve.dispatchedKwh = Reserve-Trades", figures["reserve"], disp, tol_k)
+    if not top_level or figures["required"] == 0:
+        diff.eq(w, "reserve.status", _reserve_expect(figures["required"], disp), res.get("status"))
+    price = D(res.get("priceEurPerKwh")) if res.get("priceEurPerKwh") is not None else None
+    if price is not None:
+        diff.num(w, "reserve.costEur = dispatchedKwh × Preis (Invariante 7)", round_eur(disp * price), res.get("costEur"), tol_e)
+    elif disp > 0:
+        diff.fail(w, "reserve.priceEurPerKwh fehlt, obwohl Reserve geliefert wurde")
+    else:
+        diff.num(w, "reserve.costEur ohne Reserve", ZERO, res.get("costEur"), tol_e)
+
+
 def verify_market_admin(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict | None:
-    """Mit Admin-Key: alle Positionen des Markts laden, komplett nachrechnen und mit /allocations, /trades und
-    /result (Tagesergebnis inkl. Reserve) vergleichen."""
+    """Mit Admin-Key: alle Positionen, Zuteilungen und Trades laden, Invarianten prüfen und das Tagesergebnis
+    /result dagegen abgleichen. Bei allocationRule=gruppe1 zusätzlich exakte Nachrechnung."""
     adm = sim.admin
     d = run.delivery_date
     tol_k, tol_e = sim.cfg.tolerance_kwh, sim.cfg.tolerance_eur
@@ -356,98 +443,127 @@ def verify_market_admin(sim: "Simulator", run: "MarketRun", diff: Diff) -> dict 
         return None
     result = rr.body
     resolution = (run.market or {}).get("resolution")
-    prices = Prices.from_api(result.get("prices") or (run.market or {}).get("prices") or {})
     for p in positions:
         diff.true(f"Admin: Position {p.get('id')}", p.get("status") not in ("OPEN", "CLOSED"),
                   f"Status {p.get('status')} nach SETTLED")
         _check_rejection_reason(diff, f"Admin: Position {p.get('id')}", p)
     fin = diff.market_final or {}
-    for f in ("buyPriceEurPerKwh", "sellPriceEurPerKwh", "reservePriceEurPerKwh"):
-        if f in (fin.get("prices") or {}):
-            diff.num("Admin: Tagesergebnis", f"prices.{f} (wie im Markt)", fin["prices"][f], (result.get("prices") or {}).get(f))
     try:
         if fin.get("settledAt") and result.get("settledAt"):
             diff.eq("Admin: Tagesergebnis", "settledAt (wie im Markt)", parse_ts(fin["settledAt"]), parse_ts(result["settledAt"]))
     except (TypeError, ValueError, AttributeError):
         pass
 
-    processed = [Pos.from_api(p) for p in positions if p.get("status") == "PROCESSED"]
-    if resolution == "QUARTER_HOUR":
-        dispatched = {normalize_interval(i.get("intervalStart")): D((i.get("reserve") or {}).get("dispatchedKwh", 0))
-                      for i in result.get("intervals") or []}
-    else:
-        dispatched = {None: D((result.get("reserve") or {}).get("dispatchedKwh", 0))}
-    ref = settle(processed, prices, resolution, dispatched)
-
+    processed = [p for p in positions if p.get("status") == "PROCESSED"]
     plat_alloc = {a.get("positionId"): a for a in allocs}
     diff.true("Admin: Zuteilungen", len(plat_alloc) == len(allocs), "positionId doppelt")
-    for ra in ref.allocations:
-        pa = plat_alloc.get(ra.position.id)
-        w = f"Admin: Zuteilung {ra.position.id}"
-        if pa is None:
-            diff.fail(w, "fehlt")
-            continue
-        diff.eq(w, "energyCommunityId", ra.position.energy_community_id, pa.get("energyCommunityId"))
-        diff.num(w, "allocatedKwh", ra.allocated, pa.get("allocatedKwh"), tol_k)
-        diff.eq(w, "reason", ra.reason, pa.get("reason"))
-    for pid in set(plat_alloc) - {a.position.id for a in ref.allocations}:
+    for p in processed:
+        diff.true(f"Admin: Position {p['id']}", p["id"] in plat_alloc, "PROCESSED, aber keine Zuteilung")
+    for pid in set(plat_alloc) - {p["id"] for p in processed}:
         diff.fail(f"Admin: Zuteilung {pid}", "gehört zu keiner PROCESSED-Position")
-
-    plat_tr = {(t.get("positionId"), t.get("direction"), bool(t.get("fromReserve"))): t for t in trades}
-    diff.true("Admin: Trades", len(plat_tr) == len(trades),
-              "doppelte Handelsabschlüsse (gleiche positionId, direction und fromReserve mehrfach)")
     diff.true("Admin: Trades", len({t.get("id") for t in trades}) == len(trades), "Trade-IDs nicht eindeutig")
-    ref_tr = {(t.position.id, t.direction, t.from_reserve): t for t in ref.trades}
-    for k, rt in ref_tr.items():
-        pt = plat_tr.get(k)
-        w = f"Admin: Trade {k[0]} {k[1]}{' (Reserve)' if k[2] else ''}"
-        if pt is None:
-            diff.fail(w, f"fehlt (erwartet {rt.quantity} kWh)")
-            continue
-        diff.num(w, "quantityKwh", rt.quantity, pt.get("quantityKwh"), tol_k)
-        diff.num(w, "priceEurPerKwh", rt.price, pt.get("priceEurPerKwh"))
-        diff.num(w, "amountEur", rt.amount, pt.get("amountEur"), tol_e)
-    for k in set(plat_tr) - set(ref_tr):
-        diff.fail(f"Admin: Trade {k[0]} {k[1]}", f"unerwartet ({plat_tr[k].get('quantityKwh')} kWh)")
+    for t in trades:
+        q, pr, amt = D(t.get("quantityKwh")), D(t.get("priceEurPerKwh")), D(t.get("amountEur"))
+        if None not in (q, pr, amt):
+            diff.true(f"Admin: Trade {t.get('id')}", abs(round_eur(q * pr) - amt) <= tol_e,
+                      f"amountEur {amt} ≠ round({q} × {pr}) = {round_eur(q * pr)} (Invariante 7)")
+
+    per_iv = check_invariants(diff, "Admin:", resolution, processed, plat_alloc, trades, tol_k)
 
     w = "Admin: Tagesergebnis"
     diff.eq(w, "status", "SETTLED", result.get("status"))
     diff.eq(w, "resolution", resolution, result.get("resolution"))
-    for f, v in (("totalOfferedKwh", ref.total_offered), ("tradableOfferedKwh", ref.tradable_offered),
-                 ("totalDemandKwh", ref.total_demand), ("totalPurchasedKwh", ref.total_purchased),
-                 ("totalSoldKwh", ref.total_sold)):
-        diff.num(w, f, v, result.get(f), tol_k)
-    for f, v in (("purchaseCostEur", ref.purchase_cost), ("salesRevenueEur", ref.sales_revenue), ("marginEur", ref.margin)):
-        diff.num(w, f, v, result.get(f), tol_e)
-    _cmp_reserve(diff, w, ref.reserve, result.get("reserve") or {}, tol_k, tol_e)
+    day = interval_figures(processed, plat_alloc, trades)
+    if resolution == "QUARTER_HOUR":  # Reserve gilt je Intervall, der Tag ist die Summe der Intervalle
+        day["required"] = sum((f["required"] for f in per_iv.values()), ZERO)
+    _cmp_result_block(diff, w, day, result, trades, tol_k, tol_e, top_level=True)
+    purchase = sum((_q(t.get("amountEur")) for t in trades if t.get("direction") == "PLATFORM_BUYS"), ZERO)
+    sales = sum((_q(t.get("amountEur")) for t in trades if t.get("direction") == "PLATFORM_SELLS"), ZERO)
+    diff.num(w, "purchaseCostEur = Summe der Ankaufsbeträge", purchase, result.get("purchaseCostEur"), tol_e)
+    diff.num(w, "salesRevenueEur = Summe der Verkaufsbeträge", sales, result.get("salesRevenueEur"), tol_e)
+    res_cost = _q((result.get("reserve") or {}).get("costEur"))
+    diff.num(w, "marginEur = Verkauf − Einkauf − Reserve (Invariante 8)", _q(result.get("salesRevenueEur")) -
+             _q(result.get("purchaseCostEur")) - res_cost, result.get("marginEur"), tol_e)
+    prices = result.get("prices") or {}
+    _cmp_price(diff, w, "prices.buyPriceEurPerKwh",
+               _avg([t for t in trades if t.get("direction") == "PLATFORM_BUYS"]), prices.get("buyPriceEurPerKwh"))
+    _cmp_price(diff, w, "prices.sellPriceEurPerKwh",
+               _avg([t for t in trades if t.get("direction") == "PLATFORM_SELLS"]), prices.get("sellPriceEurPerKwh"))
+    if day["reserve"] == 0:
+        diff.true(w, prices.get("reservePriceEurPerKwh") is None,
+                  f"prices.reservePriceEurPerKwh ohne Reserve muss null sein, ist {prices.get('reservePriceEurPerKwh')}")
     if resolution == "QUARTER_HOUR":
         plat_iv = {normalize_interval(i.get("intervalStart")): i for i in result.get("intervals") or []}
-        for ri in ref.intervals:
-            pi = plat_iv.get(ri.interval_start)
-            wi = f"Admin: Intervall {ri.interval_start}"
+        for k, figures in per_iv.items():
+            pi = plat_iv.get(k)
+            wi = f"Admin: Intervall {k}"
             if pi is None:
                 diff.fail(wi, "fehlt in result.intervals")
                 continue
-            for f, v in (("totalOfferedKwh", ri.total_offered), ("tradableOfferedKwh", ri.tradable_offered),
-                         ("totalDemandKwh", ri.total_demand), ("totalPurchasedKwh", ri.total_purchased),
-                         ("totalSoldKwh", ri.total_sold)):
-                diff.num(wi, f, v, pi.get(f), tol_k)
-            _cmp_reserve(diff, wi, ri.reserve, pi.get("reserve") or {}, tol_k, tol_e)
+            ivt = [t for t in trades if normalize_interval(t.get("intervalStart")) == k]
+            _cmp_result_block(diff, wi, figures, pi, ivt, tol_k, tol_e, top_level=False)
+        diff.num(w, "reserve.costEur = Summe der Intervalle",
+                 sum((_q((i.get("reserve") or {}).get("costEur")) for i in result.get("intervals") or []), ZERO),
+                 res_cost, tol_e + Decimal("0.01") * len(plat_iv))
     elif result.get("intervals"):
         diff.fail(w, "intervals ist bei DAY gesetzt")
-    return {
-        "totalOfferedKwh": str(ref.total_offered), "tradableOfferedKwh": str(ref.tradable_offered),
-        "totalDemandKwh": str(ref.total_demand), "reserveRequiredKwh": str(ref.reserve.required),
-        "reserveDispatchedKwh": str(ref.reserve.dispatched), "purchaseCostEur": str(ref.purchase_cost),
-        "salesRevenueEur": str(ref.sales_revenue), "reserveCostEur": str(ref.reserve.cost), "marginEur": str(ref.margin),
+
+    summary = {
+        "totalOfferedKwh": str(day["S"]), "totalDemandKwh": str(day["D"]), "reserveRequiredKwh": str(day["required"]),
+        "reserveDispatchedKwh": str(day["reserve"]), "purchaseCostEur": str(purchase), "salesRevenueEur": str(sales),
+        "reserveCostEur": str(res_cost), "marginEur": str(_q(result.get("marginEur"))),
+        "ruleVersion": result.get("ruleVersion"),
     }
+    if sim.cfg.allocation_rule == "gruppe1":
+        indication = Prices.from_api((run.market or {}).get("prices") or {}) if (run.market or {}).get("prices") else None
+        if resolution == "QUARTER_HOUR":
+            dispatched = {normalize_interval(i.get("intervalStart")): _q((i.get("reserve") or {}).get("dispatchedKwh"))
+                          for i in result.get("intervals") or []}
+        else:
+            dispatched = {None: _q((result.get("reserve") or {}).get("dispatchedKwh"))}
+        ref = _gruppe1_recalc(sim, diff, "Admin Gruppe 1", resolution, indication, processed, plat_alloc, trades,
+                              dispatched, tol_k, tol_e)
+        if ref:
+            summary.update({k: v for k, v in ref.items() if k not in summary or k == "marginEur"})
+    return summary
 
 
-def _cmp_reserve(diff: Diff, where: str, ref, plat: dict, tol_k, tol_e) -> None:
-    w = f"{where} reserve"
-    diff.eq(w, "status", ref.status, plat.get("status"))
-    diff.num(w, "requiredKwh", ref.required, plat.get("requiredKwh"), tol_k)
-    diff.num(w, "dispatchedKwh", ref.dispatched, plat.get("dispatchedKwh"), tol_k)
-    diff.num(w, "costEur", ref.cost, plat.get("costEur"), tol_e)
-    if ref.required > 0:
-        diff.num(w, "priceEurPerKwh", ref.price, plat.get("priceEurPerKwh"))
+def _gruppe1_recalc(sim, diff: Diff, label: str, resolution, indication: Prices | None, positions: list[dict],
+                    allocs: dict[str, dict], trades: list[dict], dispatched, tol_k, tol_e) -> dict | None:
+    """Exakte Nachrechnung nach dem Referenzbeispiel Gruppe 1 (feste Preise aus Market.prices)."""
+    if indication is None or None in (indication.buy, indication.sell, indication.reserve):
+        sim.findings.info("verify", f"{diff.delivery}: {label}: Markt ohne vollständige Preisindikation – "
+                                    "exakte Nachrechnung nach Gruppe 1 nicht möglich")
+        return None
+    if not isinstance(dispatched, dict):
+        dispatched = dict(dispatched)
+    if resolution != "QUARTER_HOUR":
+        dispatched = {None: dispatched.get(None, ZERO)}
+    ref = settle([Pos.from_api(p) for p in positions], indication, resolution, dispatched)
+    for ra in ref.allocations:
+        pa = allocs.get(ra.position.id, {})
+        w = f"{label}: Position {ra.position.id}"
+        diff.num(w, "allocatedKwh", ra.allocated, pa.get("allocatedKwh"), tol_k)
+        diff.eq(w, "reason", ra.reason, pa.get("reason"))
+    plat: dict[tuple, list[dict]] = defaultdict(list)
+    for t in trades:
+        plat[(t.get("positionId"), t.get("direction"), bool(t.get("fromReserve")))].append(t)
+    refk = {(t.position.id, t.direction, t.from_reserve): t for t in ref.trades}
+    for k, rt in refk.items():
+        pts = plat.get(k, [])
+        w = f"{label}: Trade {k[0]} {k[1]}{' (Reserve)' if k[2] else ''}"
+        if not pts:
+            diff.fail(w, f"fehlt (erwartet {rt.quantity} kWh)")
+            continue
+        diff.true(w, len(pts) == 1, f"{len(pts)} Trades statt einem")
+        diff.num(w, "quantityKwh", rt.quantity, pts[0].get("quantityKwh"), tol_k)
+        diff.num(w, "priceEurPerKwh", rt.price, pts[0].get("priceEurPerKwh"))
+        diff.num(w, "amountEur", rt.amount, pts[0].get("amountEur"), tol_e)
+    for k in set(plat) - set(refk):
+        diff.fail(f"{label}: Trade {k[0]} {k[1]}", f"unerwartet ({plat[k][0].get('quantityKwh')} kWh)")
+    return {
+        "totalOfferedKwh": str(ref.total_offered), "totalDemandKwh": str(ref.total_demand),
+        "reserveRequiredKwh": str(ref.reserve.required), "reserveDispatchedKwh": str(ref.reserve.dispatched),
+        "purchaseCostEur": str(ref.purchase_cost), "salesRevenueEur": str(ref.sales_revenue),
+        "reserveCostEur": str(ref.reserve.cost), "marginEur": str(ref.margin),
+    }

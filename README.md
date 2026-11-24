@@ -1,6 +1,6 @@
 # EGSim – Dummy-Energiegemeinschaften für die Handelsplattform
 
-EGSim simuliert Energiegemeinschaften (EGs), die mit eurer Handelsplattform sprechen (**Datenvertrag 0.2**).
+EGSim simuliert Energiegemeinschaften (EGs), die mit eurer Handelsplattform sprechen (**Datenvertrag 0.3.1**).
 Er verhält sich wie echte EGs: Er meldet sich an, reicht Angebote und Bedarfe ein, ändert und storniert sie und holt
 nach dem Settlement Zuteilungen und Handelsabschlüsse ab. Dabei prüft er **jede Antwort gegen die Schemas des Vertrags**
 (siehe „Schema-Prüfung“). Dazu kommen rund 130 Negativ- und Vertragstests (Fehlercodes, Rollen, Mandantentrennung,
@@ -67,15 +67,24 @@ meldet sie den Saldo. Gleicher Seed = gleiche Mengen und Preise.
 ## Szenarien (Randfälle)
 
 Jedes Szenario legt feste Positionen an und kennt das erwartete Ergebnis. Die Erwartungen sind von Hand aus dem
-Vertrag abgeleitet, zusätzlich rechnet EGSim jedes Szenario mit der Referenzlogik nach.
+Vertrag abgeleitet. Seit 0.3 hat jede Plattform ihre eigene Preis- und Zuteilungsregel, verbindlich sind nur die
+Invarianten. Deshalb gibt es die Einstellung **Zuteilungsregel** (`run.allocationRule`):
+
+- `invariants` (Standard): passt für jede Plattform. Geprüft werden Status, Invarianten (Ankauf = min(S, D), keine
+  Zuteilung über der Menge, Reserve, Summen, Betrag = Menge × Preis, Marge) und Erwartungen, die daraus zwingend folgen.
+  Bei Überangebot reicht eine zur Regel passende `reason` (`PARTIALLY_ALLOCATED`/`NOT_ALLOCATED`/`FULLY_ALLOCATED`).
+- `gruppe1`: zusätzlich exakt nach dem Referenzbeispiel Gruppe 1 (pro rata, Rundungsrest nach `createdAt`, Reserve pro
+  rata, Beträge aus den festen Preisen in `Market.prices`). Nur für Plattformen, die genau so rechnen.
+
+Fehlt `Market.prices` (seit 0.3 optional), rechnet EGSim Preisvorstellungen relativ zu 0,10 EUR/kWh.
 
 | ID | Szenario | Erwartung |
 |---|---|---|
 | SZ-01 | Angebot = Bedarf | beide voll, keine Reserve |
-| SZ-02 | Preisvorstellung = Ankaufspreis | noch handelbar |
-| SZ-03 | Preisvorstellung 0,00001 € über Ankaufspreis | `PRICE_NOT_MET`, Bedarf aus der Reserve |
-| SZ-04 | 3 × 5 kWh Angebot, 10 kWh Bedarf | 3,334 / 3,333 / 3,333, Rest an das zuerst eingereichte Angebot |
-| SZ-05 | 100 + 60 kWh Angebot, 120 kWh Bedarf | 75 / 45 kWh |
+| SZ-02 | Preisvorstellung = Ankaufspreis | gehandelt |
+| SZ-03 | Preisvorstellung 0,05 € über Ankaufspreis | trotzdem voll gehandelt (Preisvorstellung ist kein Mindestpreis) |
+| SZ-04 | 3 × 5 kWh Angebot, 10 kWh Bedarf | zusammen 10 kWh; Gruppe 1: 3,334 / 3,333 / 3,333, Rest an das zuerst eingereichte Angebot |
+| SZ-05 | 100 + 60 kWh Angebot, 120 kWh Bedarf | zusammen 120 kWh, keine Reserve; Gruppe 1: 75 / 45 kWh |
 | SZ-06 | nur Bedarf | volle Reserve (oder `RESERVE_SHORTAGE`) |
 | SZ-07 | nur Angebot | `NOT_NEEDED`, kein Trade |
 | SZ-08 | 0,001 kWh | Trade über 0,001 kWh, Betrag gerundet |
@@ -84,15 +93,17 @@ Vertrag abgeleitet, zusätzlich rechnet EGSim jedes Szenario mit der Referenzlog
 | SZ-11 | Ändern und Stornieren | zählt der letzte Stand, Storno ohne Zuteilung |
 | SZ-12 | EG nach dem Einreichen gesperrt (Admin) | Position `REJECTED` mit `rejectionReason ENERGY_COMMUNITY_NOT_ACTIVE` |
 | SZ-13 | Unterangebot: 30 kWh Angebot, 50 kWh Bedarf | Angebot voll, 20 kWh aus der Reserve |
-| SZ-14 | Beispielablauf aus dem Vertrag (100 + 50 kWh Angebot, 130 kWh Bedarf) | Reserve 30 kWh; mit den Preisen 0,10 / 0,14 / 0,20: Einkauf 10,00, Verkauf 18,20, Reserve 6,00, Marge 2,20 EUR |
-| SZ-15 | Handelbares und nicht handelbares Angebot, zwei Bedarfe | Reserve 20 kWh pro rata auf die Bedarfe (12 / 8 kWh), je ein Trade aus Angeboten und aus der Reserve |
-| SZ-16 | Doppelter Request: dasselbe Angebot gleichzeitig 5-mal | genau eine Position, 4 × `409 POSITION_ALREADY_EXISTS`, ein Trade |
-| SZ-17 | Parallele Einreichung von vier EGs | keine Überbuchung: je 20 kWh pro Angebot, genau 4 Trades, Summen im Tagesergebnis stimmen |
+| SZ-14 | Beispielablauf aus dem Vertrag 0.3 (100 + 50 kWh Angebot, das zweite mit hoher Preisvorstellung, 170 kWh Bedarf) | beide Angebote voll, Reserve 20 kWh; Gruppe 1 (0,10 / 0,14 / 0,20): Einkauf 15,00, Verkauf 23,80, Reserve 4,00, Marge 4,80 EUR |
+| SZ-15 | Zwei Angebote, zwei Bedarfe, Unterangebot | Angebote voll, Reserve 20 kWh; Gruppe 1: pro rata 12 / 8 kWh, je ein Trade aus Angeboten und aus der Reserve |
+| SZ-16 | Doppelter Request: dasselbe Angebot gleichzeitig 5-mal mit verschiedenen Keys | genau eine Position, 4 × `409 POSITION_ALREADY_EXISTS`, ein Trade |
+| SZ-17 | Parallele Einreichung von vier EGs | keine Überbuchung: zusammen 40 kWh gekauft, Summen stimmen; Gruppe 1: je 20 kWh, genau 4 Trades |
+| SZ-18 | Dieselbe Position 3-mal gleichzeitig mit **demselben** Idempotency-Key | dreimal 201 mit derselben Position, nur ein Trade |
 | SZ-20 | jede Viertelstunde des Tages | 96 bzw. 92/100 an Umstellungstagen angenommen |
 | SZ-21 | Lasttest | alle EGs gleichzeitig, keine Serverfehler, Latenz p95 |
 
-Mit Admin-Key prüfen SZ-13 bis SZ-17 zusätzlich das Tagesergebnis (`/result`) und die Gesamtzahl der Trades. Die
-Beträge von SZ-14 (Marge 2,20) gelten im Tagesmarkt und nur, wenn das Kraftwerk die Reserve voll geliefert hat.
+Mit Admin-Key prüfen die Szenarien zusätzlich das Tagesergebnis (`/result`) und die gehandelten Mengen im Intervall
+(doppelte Trades fallen auf). Die Beträge von SZ-14 (Marge 4,80) gelten nur mit `gruppe1`, im Tagesmarkt und wenn das
+Kraftwerk die Reserve voll geliefert hat.
 
 Im **15-Minuten-Markt** bekommt jedes Szenario eine eigene Viertelstunde ab 10:00 Uhr Wiener Zeit, alle laufen auf
 einem Markt. Der Lasttest nutzt 15:00–19:00 Uhr. Im **Tagesmarkt** braucht jedes Szenario einen eigenen Liefertag.
@@ -106,21 +117,38 @@ Plattform. EGSim prüft dann, ob Zuteilungen und Trades dazu passen.
 
 ## Vertragsstand
 
-`contract/Datenvertrag.yaml` ist die **korrigierte Fassung 0.2 vom 19.11.2026**. Gegenüber dem Stand vom 16.11. prüft EGSim zusätzlich:
+`contract/Datenvertrag.yaml` ist **Fassung 0.3.1** (0.3 plus Präzisierungen, keine neuen Felder). EGSim akzeptiert
+`Api-Version` 0.3.x. Was sich gegenüber 0.2 für den Simulator geändert hat:
 
-- **Marktpreise:** `buyPriceEurPerKwh`, `sellPriceEurPerKwh` und `reservePriceEurPerKwh` sind Pflicht und nie `null` (Schema und Marktprüfung).
-- **`close`:** Jede Antwort, auch eine Wiederholung oder ein paralleler Aufruf, ist `200` bei `SETTLED` und `202` bei `CLOSED`.
-- **POS-08:** `PUT` eines Bedarfs mit Preisvorstellung ergibt `400 VALIDATION_FAILED`, und die Position bleibt unverändert (Menge und Preis werden danach nachgelesen).
+- **Preise und Zuteilung:** Die Preisvorstellung ist nur informativ, `PRICE_NOT_MET` gibt es nicht mehr, neu ist
+  `NOT_ALLOCATED`. `Market.prices` ist eine optionale Indikation, `MarketResult.prices` sind Durchschnittspreise
+  (gewichtet nach Menge, `null` ohne Geschäft). `tradableOfferedKwh` entfällt, Summen sind unbegrenzt.
+- **Idempotenz:** `POST /positions` verlangt `Idempotency-Key` (UUID), die Registrierung erlaubt ihn. Gleicher Key und
+  Inhalt → gespeicherte Antwort (auch nach `closesAt`), anderer Inhalt → `409 IDEMPOTENCY_KEY_REUSED`, Key gilt pro
+  Identität, 401/403/429 werden nicht gespeichert, parallele Requests erzeugen keine zweite Position (`IDEM-01` bis `IDEM-09`, SZ-18).
+  Der Simulator wiederholt nach Timeout oder 5xx mit demselben Key.
+- **`communityCode`:** Pflicht bei der Registrierung (3–40 Zeichen, Kleinbuchstaben, Ziffern, einzelne Bindestriche),
+  eindeutig (`409 COMMUNITY_CODE_ALREADY_REGISTERED`), unveränderlich (`REG-11` bis `REG-15`). In der UI je EG
+  einstellbar, leer = Vorschlag aus dem Namen.
+- **Header:** `X-Request-Id` in jeder Antwort (mitgeschickte wird übernommen), `requestId` in jedem Fehler,
+  `Api-Version`, bei `429` `Retry-After` (`REQ-01/02`, Header-Prüfung bei jeder Antwort).
+- **Rate-Limit:** Login und Registrierung können `429 RATE_LIMITED` liefern. `RATE-01` (optional, UI „Rate-Limit-Test“)
+  provoziert das mit Fehlversuchen; EGSim selbst wartet einmal `Retry-After` ab (bis 10 s).
+- **Sonstiges:** `GET /markets?status=` (`MKT-01` bis `03`, Liefertag „open“ in der UI), historische Liefertage sind
+  erlaubt (`DELIVERY_DATE_IN_PAST` entfällt), `DELETE` auf eine stornierte Position → `200`, `PUT` ersetzt die Position
+  (fehlende Preisvorstellung wird entfernt, `POS-09`), neue Prüfreihenfolge.
 
 ## Schema-Prüfung
 
 Jede Antwort der Plattform wird gegen die Schemas des Datenvertrags geprüft (`contract/Datenvertrag.yaml`, daraus
 erzeugt als `egsim/contract.json`): Pflichtfelder, Typen (eine Zahl als String `"10"` fällt auf), Wertebereiche,
 Nachkommastellen, Formate (UUID, Datum, RFC-3339-Zeitstempel, `intervalStart` nur voll auf der Viertelstunde in UTC),
-erlaubte Enum-Werte und das Fehlerformat (`code` aus der Liste des Vertrags, `message`, `details`). Außerdem:
+erlaubte Enum-Werte und das Fehlerformat (`code` aus der Liste des Vertrags, `message`, `requestId`, `details`). Außerdem:
 
 - Antworten müssen JSON mit `Content-Type: application/json` sein, `204` hat keinen Body.
-- Ein Statuscode, der für den Endpoint nicht im Vertrag steht, ist eine Warnung (401, 403 und 500 gelten überall).
+- Ein Statuscode, der für den Endpoint nicht im Vertrag steht, ist eine Warnung (401, 403, 429 und 500 gelten überall).
+- Header: `X-Request-Id` (1–128 Zeichen, gleich der mitgeschickten), `Api-Version` (andere Nebenversion = Warnung),
+  `requestId` im Fehler gleich dem Header, `Retry-After` bei 429.
 - Passwörter, API-Keys und Hashes dürfen nur in der Antwort von `POST /energy-communities/{id}/credentials` stehen,
   das Token nur im Login.
 
@@ -130,22 +158,18 @@ und in `contractIssues`. Ausschalten: `run.validateSchema = false` bzw. in der U
 Neue Vertragsversion: YAML in `contract/` ersetzen und `python tools/gen_contract.py --check` ausführen (braucht
 PyYAML, nur für Entwickler). Das Skript prüft dabei auch, ob alle Beispiele des Vertrags zu seinen Schemas passen.
 
-**Bekannter Fehler im Vertrag 0.2:** `totalOfferedKwh`, `tradableOfferedKwh`, `totalDemandKwh`, `totalPurchasedKwh`,
-`totalSoldKwh` (Tagesergebnis und Intervalle) und `reserve.requiredKwh`/`dispatchedKwh` nutzen das Schema
-`QuantityKwhNonNegative` mit `maximum: 1000000`. Das ist die Grenze einer einzelnen Position, Tagessummen dürfen sie
-überschreiten (SZ-09 reicht allein 1.000.000 kWh ein). Der Prüfer lässt für diese Felder das Maximum weg
-(`KNOWN_CONTRACT_ISSUES` in `egsim/contract.py`). Im Vertrag sollte ein eigenes Summenschema ohne Maximum stehen.
-
 ## Ergebnisprüfung
 
 - **Immer (EG-Sicht):** Mandantentrennung, Positionsstatus nach dem Settlement, genau eine Zuteilung je Position,
-  `reason` passend zu Menge, Typ und Preisvorstellung. Trades passend zur Zuteilung, Preise, Beträge (kaufmännisch gerundet).
-  Teilzuteilung pro rata über alle simulierten EGs.
-- **Mit Admin-Key:** Alle Positionen des Markts werden komplett nachgerechnet und mit `/allocations`, `/trades` und
-  dem Tagesergebnis `/result` verglichen, inklusive Reserve und Marge, bei 15 Minuten auch je Intervall.
-  Doppelte Handelsabschlüsse (gleiche Position, Richtung und Reserveanteil oder gleiche Trade-ID) fallen auf.
+  `reason` passend zu Menge und Typ, Trades passend zur Zuteilung, Beträge = Menge × Preis (kaufmännisch gerundet).
+  Weichen Trade-Preise von der Preisindikation ab, ist das nur ein Hinweis.
+- **Mit Admin-Key:** Invarianten 3–8 je Intervall aus allen Positionen, `/allocations` und `/trades`, dazu das
+  Tagesergebnis `/result`: Summen, Reserve (bei 15 Minuten Summe der Intervalle), Beträge, Marge und die
+  Durchschnittspreise (`null` ohne Geschäft). Doppelte Handelsabschlüsse fallen auf.
+- **Mit `allocationRule = gruppe1`:** zusätzlich exakte Nachrechnung nach dem Referenzbeispiel (braucht vollständige
+  `Market.prices`).
 - **Marktzustand nach dem Settlement:** `SETTLED` mit `closedAt` und `settledAt` (nicht davor), `failureReason` leer,
-  `resolution`, `closesAt` und die drei Preise unverändert gegenüber dem Start, `/result` zeigt dieselben Preise.
+  `resolution` und `closesAt` unverändert. Eine geänderte Preisindikation ist nur ein Hinweis.
 - **Positionen:** `rejectionReason` nur bei `REJECTED` und dann `ENERGY_COMMUNITY_NOT_ACTIVE`.
 - **Ohne Admin, „Nur simulierte EGs am Markt“:** Komplette Nachrechnung aus den Daten der simulierten EGs.
 
@@ -164,7 +188,9 @@ PyYAML, nur für Entwickler). Das Skript prüft dabei auch, ob alle Beispiele de
 | `FIL` | Filter `type`, `status`, `energyCommunityId`, `intervalStart`, `direction`, `positionId` wirken (auch die Gegenprobe), ungültige Filterwerte → 400 (vor 409) |
 | `NF-07` | Position für einen Liefertag ohne Markt → 404 `MARKET_NOT_FOUND` |
 | `ADM` (Admin) | Statusübergänge, PENDING/gesperrte EG → 403 auch bei Positionen einreichen/ändern/stornieren/auflisten, neue Zugangsdaten machen alte API-Keys **und Tokens** ungültig, Löschen (204/409), Admin sieht fremde Positionen und EGs, Markt-Schließen idempotent (Zuteilungen und Trades bleiben gleich) und auch bei 4 gleichzeitigen Aufrufen |
-| `REG` (optional) | Registrierung mit ungültigen Daten → 400, doppelte E-Mail → 409 |
+| `REG` (optional) | Registrierung mit ungültigen Daten → 400, doppelte E-Mail bzw. `communityCode` → 409, `communityCode` fehlt/ungültig → 400, im Profil nicht änderbar, Idempotency-Key bei der Registrierung |
+| `IDEM`, `REQ`, `MKT` | Idempotency-Key (siehe Vertragsstand), X-Request-Id/requestId, `GET /markets` mit Filter |
+| `RATE` (optional) | Login-Fehlversuche → `429 RATE_LIMITED` mit `Retry-After` |
 
 ## Hosten
 
@@ -206,15 +232,15 @@ aus Umgebungsvariablen gelesen, so müssen keine Secrets in der Datei stehen.
 
 ## Annahmen zum Datenvertrag (bitte abstimmen)
 
-1. **Markt anlegen:** Dafür gibt es keinen Endpoint. Seit der korrigierten Fassung vom 19.11. regelt der Vertrag das als Betreiberprozess: Bis der Markt konfiguriert ist, antworten `GET /markets/{deliveryDate}` und `POST /positions` mit `404 MARKET_NOT_FOUND`. EGSim setzt voraus, dass der Markt existiert.
-2. **Liefertag in der Vergangenheit ohne Markt:** Laut Prüfreihenfolge 404 vor 422. `VAL-13` akzeptiert beides.
-3. **Unbekannte vs. fremde EG-ID:** 404 für unbekannt, 403 für fremd (Prüfreihenfolge).
-4. **`PUT /positions/{id}` ohne Preisvorstellung:** Ob sie entfernt oder behalten wird, ist offen. EGSim schickt sie immer mit.
-5. **Rundungsrest:** Er geht in 0,001-kWh-Schritten nach `createdAt` an alle beteiligten Positionen (SZ-04).
-6. **Reserveanteil im Trade:** pro rata von der gelieferten Reserve, Anteil aus Angeboten = Zuteilung − Reserveanteil.
-7. **Stornierte Position:** Sie blockiert den Slot nicht für eine neue Position (SZ-20, SZ-21).
-8. **Zugangsdaten für PENDING-EGs:** Die Vergabe ist erlaubt, eine Anmeldung damit ergibt 403 (`ADM-07` bis `ADM-09`).
-9. **`createdAt` nach PUT:** Es bleibt unverändert, weil es die Rundungsreihenfolge bestimmt.
+1. **Markt anlegen:** Laut Vertrag legt der Betreiber den Markt außerhalb der API an (Deployment-Konfiguration oder
+   Initialisierungsprozess). Bis dahin antworten `GET /markets/{deliveryDate}` und `POST /positions` mit
+   `404 MARKET_NOT_FOUND`. EGSim setzt voraus, dass der Markt existiert, und findet offene Märkte über `GET /markets`.
+2. **Unbekannte vs. fremde EG-ID:** 404 für unbekannt, 403 für fremd (Prüfreihenfolge).
+3. **Stornierte Position:** Sie blockiert den Slot nicht für eine neue Position (SZ-20, SZ-21).
+4. **Zugangsdaten für PENDING-EGs:** Die Vergabe ist erlaubt, eine Anmeldung damit ergibt 403 (`ADM-07` bis `ADM-09`).
+5. **`createdAt` nach PUT:** Es bleibt unverändert (bei Gruppe 1 bestimmt es die Rundungsreihenfolge).
+6. **Gleichzeitige Requests mit verschiedenen Keys** für denselben Slot: genau einer wird angenommen, die anderen
+   bekommen `409 POSITION_ALREADY_EXISTS` (SZ-16).
 
 ## Projektstruktur
 
@@ -239,7 +265,7 @@ tests/            pytest: Vertragsbeispiele, Profile/Config, Ende-zu-Ende gegen 
 ```
 
 Gegen den Mock zeigt ein „OK“ nur, dass der Ablauf funktioniert, denn Mock und Prüfung nutzen dieselbe
-Referenzlogik. Die Logik selbst sichern die Unit-Tests mit den Beispielen aus dem Vertrag und die handgeschriebenen
+Referenzlogik (Gruppe 1). Die Logik selbst sichern die Unit-Tests mit den Beispielen aus dem Vertrag und die handgeschriebenen
 Szenario-Erwartungen ab.
 
 ```bash

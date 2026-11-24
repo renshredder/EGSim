@@ -15,6 +15,16 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+COMMUNITY_CODE_RE = re.compile(r"^(?=.{3,40}$)[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def community_code_from(name: str) -> str:
+    """Vorschlag für den communityCode aus dem Namen, z. B. 'EG Sonnenfeld' → 'eg-sonnenfeld'."""
+    tr = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"})
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower().translate(tr)).strip("-")[:40].strip("-")
+    return slug if len(slug) >= 3 else (slug + "-eg")[:40]
+
+
 PROFILES = ("solar", "wind", "flat", "household", "business", "night")
 
 _ENV = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -80,6 +90,7 @@ class CommunityConfig:
     enabled: bool = True
     description: str | None = None
     email: str | None = None
+    community_code: str | None = None  # plattformübergreifende Kennung (Vertrag 0.3), z. B. eg-sonnenfeld
     auth: str = "apiKey"  # apiKey | bearer
     api_key: str | None = None
     password: str | None = None
@@ -122,6 +133,8 @@ class Config:
     checks: bool = True
     validate_schema: bool = True
     registration_checks: bool = False
+    rate_limit_checks: bool = False
+    allocation_rule: str = "invariants"  # invariants | gruppe1
     on_existing_position: str = "skip"
     report_dir: str | None = "reports"
     fail_on_findings: bool = True
@@ -152,6 +165,7 @@ def default_config_dict() -> dict:
             "seed": 42, "deliveryDates": ["tomorrow"], "concurrency": 4, "delayMs": [0, 0],
             "submitPositions": True, "waitForSettlementMinutes": 0, "verifyResults": True,
             "allParticipantsSimulated": False, "checks": True, "validateSchema": True, "registrationChecks": False,
+            "rateLimitChecks": False, "allocationRule": "invariants",
             "onExistingPosition": "skip", "reportDir": "reports", "failOnFindings": True,
             "tolerance": {"kwh": 0, "eur": 0}, "autoProvision": True, "closeMarket": False, "parallelClose": 1, "adminChecks": True,
             "scenarios": [], "scenarioDates": [],
@@ -165,7 +179,7 @@ def default_config_dict() -> dict:
 
 def new_community_dict(name: str = "Neue EG", **extra) -> dict:
     d = {"uid": uuid.uuid4().hex[:12], "name": name, "enabled": True, "description": "Simulierte EG (EGSim)",
-         "email": "", "auth": "apiKey", "apiKey": "", "password": "", "energyCommunityId": "",
+         "email": "", "communityCode": "", "auth": "apiKey", "apiKey": "", "password": "", "energyCommunityId": "",
          "generation": None, "consumption": None, "priceExpectation": None}
     d.update(extra)
     return d
@@ -202,6 +216,10 @@ def _community(raw: dict, i: int) -> CommunityConfig:
             raise ConfigError(f"{where}: Nachkommastellen der Preisvorstellung 0 bis 5")
         if not 0 <= pe.probability <= 1:
             raise ConfigError(f"{where}: Wahrscheinlichkeit der Preisvorstellung 0 bis 1")
+    code = (raw.get("communityCode") or "").strip()
+    if code and not COMMUNITY_CODE_RE.match(code):
+        raise ConfigError(f"{where}: communityCode '{code}' ungültig (Kleinbuchstaben, Ziffern, einzelne Bindestriche, "
+                          "3–40 Zeichen)")
     auth = raw.get("auth") or "apiKey"
     if auth not in ("apiKey", "bearer"):
         raise ConfigError(f"{where}: Anmeldung apiKey oder bearer")
@@ -211,6 +229,7 @@ def _community(raw: dict, i: int) -> CommunityConfig:
         enabled=bool(raw.get("enabled", True)),
         description=raw.get("description") or None,
         email=raw.get("email") or None,
+        community_code=(raw.get("communityCode") or "").strip() or None,
         auth=auth,
         api_key=raw.get("apiKey") or None,
         password=raw.get("password") or None,
@@ -244,6 +263,8 @@ def parse_config(raw: dict) -> Config:
         raise ConfigError("Mindestens einen Liefertag angeben")
     from egsim.timeutil import resolve_delivery_date
     for d in cfg.delivery_dates:
+        if d.lower() == "open":  # alle offenen Märkte (GET /markets?status=OPEN, ab Vertrag 0.3)
+            continue
         try:
             resolve_delivery_date(d)
         except ValueError as exc:
@@ -258,6 +279,10 @@ def parse_config(raw: dict) -> Config:
     cfg.checks = bool(run.get("checks", cfg.checks))
     cfg.validate_schema = bool(run.get("validateSchema", cfg.validate_schema))
     cfg.registration_checks = bool(run.get("registrationChecks", cfg.registration_checks))
+    cfg.rate_limit_checks = bool(run.get("rateLimitChecks", cfg.rate_limit_checks))
+    cfg.allocation_rule = run.get("allocationRule") or cfg.allocation_rule
+    if cfg.allocation_rule not in ("invariants", "gruppe1"):
+        raise ConfigError("Zuteilungsregel: invariants oder gruppe1")
     cfg.on_existing_position = run.get("onExistingPosition", cfg.on_existing_position)
     if cfg.on_existing_position not in ("skip", "update"):
         raise ConfigError("Bestehende Position: skip oder update")
@@ -271,6 +296,8 @@ def parse_config(raw: dict) -> Config:
     sd = run.get("scenarioDates") or []
     cfg.scenario_dates = [str(x).strip() for x in (sd if isinstance(sd, list) else [sd]) if str(x).strip()]
     for x in cfg.scenario_dates:
+        if x.lower() == "open":
+            continue
         try:
             resolve_delivery_date(x)
         except ValueError as exc:

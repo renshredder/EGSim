@@ -1,6 +1,11 @@
-"""Referenzimplementierung der Handels- und Preislogik aus dem Datenvertrag 0.2 (Decimal, keine Floats).
+"""Referenzregel „Gruppe 1“ aus dem Datenvertrag 0.3.1 (Decimal, keine Floats).
 
-Wird vom Verifier genutzt, um die Ergebnisse der Plattform nachzurechnen, und vom Mock-Server.
+Seit 0.3 legt jede Plattform ihre Preis- und Zuteilungsregel selbst fest; verbindlich sind nur die Invarianten
+(siehe verify.py). Diese Datei rechnet das nicht verbindliche Referenzbeispiel der Gruppe 1 nach:
+feste Preise je Markt, bei Überangebot pro rata, Abrunden auf 0,001 kWh, Rest nach createdAt, Reserve pro rata.
+Die Preisvorstellung ist nur informativ und spielt keine Rolle.
+
+Genutzt vom Verifier (Option „Referenzregel Gruppe 1“) und vom Mock-Server.
 """
 from __future__ import annotations
 
@@ -115,6 +120,9 @@ class SettlementRef:
     purchase_cost: Decimal
     sales_revenue: Decimal
     margin: Decimal
+    avg_buy: Decimal | None = None      # MarketResult.prices: Durchschnittspreise, gewichtet nach Menge
+    avg_sell: Decimal | None = None
+    avg_reserve: Decimal | None = None
 
     @property
     def allocations(self) -> list[Allocation]:
@@ -158,27 +166,20 @@ def settle_interval(positions: list[Pos], prices: Prices, dispatched: Decimal | 
     (Mock) oder None (= Reserve deckt vollständig)."""
     offers = [p for p in positions if p.type == "OFFER"]
     demands = [p for p in positions if p.type == "DEMAND"]
-
-    def tradable(p: Pos) -> bool:
-        if p.price_expectation is None:
-            return True
-        return prices.buy is not None and p.price_expectation <= prices.buy
-
-    trad = [p for p in offers if tradable(p)]
-    non_trad = [p for p in offers if not tradable(p)]
-    S = sum((p.quantity for p in trad), ZERO)
+    S = sum((p.quantity for p in offers), ZERO)
     Dm = sum((p.quantity for p in demands), ZERO)
 
-    allocs: list[Allocation] = [Allocation(p, ZERO, "PRICE_NOT_MET") for p in non_trad]
-    if Dm == 0:
-        allocs += [Allocation(p, ZERO, "NOT_NEEDED") for p in trad]
+    allocs: list[Allocation] = []
+    if Dm == 0:  # ohne Nachfrage weder Ankauf noch Reserve
+        allocs += [Allocation(p, ZERO, "NOT_NEEDED") for p in offers]
         purchased = ZERO
     elif S <= Dm:
-        allocs += [Allocation(p, p.quantity, "FULLY_ALLOCATED") for p in trad]
+        allocs += [Allocation(p, p.quantity, "FULLY_ALLOCATED") for p in offers]
         purchased = S
     else:
-        shares = pro_rata(trad, Dm)
-        allocs += [Allocation(p, shares[p.id], "PARTIALLY_ALLOCATED") for p in trad]
+        shares = pro_rata(offers, Dm)
+        allocs += [Allocation(p, shares[p.id], "PARTIALLY_ALLOCATED" if shares[p.id] > 0 else "NOT_ALLOCATED")
+                   for p in offers]
         purchased = Dm
 
     required = max(Dm - S, ZERO)
@@ -245,6 +246,14 @@ def _aggregate_reserve(parts: list[ReserveRef], prices: Prices) -> ReserveRef:
     return ReserveRef(status, required, disp, prices.reserve if required > 0 else None, cost)
 
 
+def weighted_price(trades: list[TradeRef]) -> Decimal | None:
+    """Durchschnittspreis gewichtet nach Menge, auf 5 Nachkommastellen gerundet; None ohne Geschäft."""
+    qty = sum((t.quantity for t in trades), ZERO)
+    if qty == 0:
+        return None
+    return (sum((t.quantity * t.price for t in trades), ZERO) / qty).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP)
+
+
 def settle(positions: Iterable[Pos], prices: Prices, resolution: str,
            dispatched: dict[str | None, Decimal] | Callable[[Decimal], Decimal] | None = None) -> SettlementRef:
     """Rechnet einen Markt ab. `positions` = alle beim Marktschluss CLOSED Positionen (nach Settlement PROCESSED)."""
@@ -272,4 +281,7 @@ def settle(positions: Iterable[Pos], prices: Prices, resolution: str,
         purchase_cost=purchase,
         sales_revenue=sales,
         margin=sales - purchase - reserve.cost,
+        avg_buy=weighted_price([t for t in trades if t.direction == "PLATFORM_BUYS"]),
+        avg_sell=weighted_price([t for t in trades if t.direction == "PLATFORM_SELLS"]),
+        avg_reserve=reserve.price if reserve.dispatched > 0 else None,
     )

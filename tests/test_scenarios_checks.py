@@ -12,11 +12,11 @@ from egsim.mockserver import MockPlatform
 from egsim.simulator import Simulator
 from egsim.timeutil import format_utc, now_utc
 
-from test_e2e_mock import _admin_setup, _setup
+from test_e2e_mock import _admin_setup, _setup, operator_closes
 
 
-def run_scenarios(platform, ids, resolution="QUARTER_HOUR"):
-    srv, raw, d = _admin_setup(platform, resolution, scenarios=ids)
+def run_scenarios(platform, ids, resolution="QUARTER_HOUR", rule="invariants"):
+    srv, raw, d = _admin_setup(platform, resolution, scenarios=ids, allocationRule=rule)
     raw["communities"] = []
     try:
         rep = Simulator(parse_config(raw)).run_scenarios()
@@ -31,15 +31,16 @@ def failed_checks(rep):
 
 # ------------------------------------------------------------------------------------------------ Szenarien
 @pytest.mark.parametrize("resolution", ["QUARTER_HOUR", "DAY"])
-def test_neue_szenarien_bestehen_gegen_korrekten_mock(resolution):
-    ids = ["SZ-13", "SZ-14", "SZ-15", "SZ-16", "SZ-17"]
+@pytest.mark.parametrize("rule", ["invariants", "gruppe1"])
+def test_neue_szenarien_bestehen_gegen_korrekten_mock(resolution, rule):
+    ids = ["SZ-13", "SZ-14", "SZ-15", "SZ-16", "SZ-17", "SZ-18"]
     p = MockPlatform()
     if resolution == "DAY":  # im Tagesmarkt braucht jedes Szenario einen eigenen Liefertag
         d0 = now_utc().date()
-        for i in range(1, 6):
+        for i in range(1, 7):
             p.add_market((d0 + timedelta(days=i)).isoformat(), "DAY", closes_at=now_utc() + timedelta(hours=1))
-        srv, raw, _ = _admin_setup(p, "DAY", scenarios=ids)
-        raw["run"]["scenarioDates"] = [(d0 + timedelta(days=i)).isoformat() for i in range(1, 6)]
+        srv, raw, _ = _admin_setup(p, "DAY", scenarios=ids, allocationRule=rule)
+        raw["run"]["scenarioDates"] = [(d0 + timedelta(days=i)).isoformat() for i in range(1, 7)]
         raw["communities"] = []
         try:
             rep = Simulator(parse_config(raw)).run_scenarios()
@@ -47,16 +48,16 @@ def test_neue_szenarien_bestehen_gegen_korrekten_mock(resolution):
             srv.shutdown()
         res = {s["id"]: s for s in rep["scenarios"]}
     else:
-        res, rep = run_scenarios(p, ids)
+        res, rep = run_scenarios(p, ids, rule=rule)
     assert {k: v["result"] for k, v in res.items()} == {i: "PASS" for i in ids}, \
         {k: v["messages"] for k, v in res.items() if v["result"] != "PASS"}
     assert rep["totals"]["errors"] == 0, [f for f in rep["findings"] if f["severity"] == "error"]
 
 
-def test_beispielablauf_aus_dem_vertrag_marge_2_20():
-    """SZ-14 mit den Preisen des Vertrags (0,10 / 0,14 / 0,20): Einkauf 10,00, Verkauf 18,20, Reserve 6,00, Marge 2,20."""
+def test_beispielablauf_aus_dem_vertrag_marge_4_80():
+    """SZ-14 mit den Preisen von Gruppe 1 (0,10 / 0,14 / 0,20): Einkauf 15,00, Verkauf 23,80, Reserve 4,00, Marge 4,80."""
     p = MockPlatform()
-    srv, raw, d = _admin_setup(p, "DAY", scenarios=["SZ-14"])
+    srv, raw, d = _admin_setup(p, "DAY", scenarios=["SZ-14"], allocationRule="gruppe1")
     raw["communities"] = []
     try:
         rep = Simulator(parse_config(raw)).run_scenarios()
@@ -64,9 +65,52 @@ def test_beispielablauf_aus_dem_vertrag_marge_2_20():
     finally:
         srv.shutdown()
     assert rep["scenarios"][0]["result"] == "PASS", rep["scenarios"][0]["messages"]
-    assert (res["purchaseCostEur"], res["salesRevenueEur"], res["marginEur"]) == (Decimal("10.00"), Decimal("18.20"),
-                                                                                  Decimal("2.20"))
-    assert res["reserve"]["costEur"] == Decimal("6.00") and res["reserve"]["requiredKwh"] == Decimal("30")
+    assert (res["purchaseCostEur"], res["salesRevenueEur"], res["marginEur"]) == (Decimal("15.00"), Decimal("23.80"),
+                                                                                  Decimal("4.80"))
+    assert res["reserve"]["costEur"] == Decimal("4.00") and res["reserve"]["requiredKwh"] == Decimal("20")
+
+
+class OhnePreisindikation(MockPlatform):
+    """Markt ohne Market.prices (ab Vertrag 0.3 optional)."""
+
+    def add_market(self, *a, **kw):
+        return super().add_market(*a, **{**kw, "show_prices": False})
+
+
+def test_szenarien_ohne_preisindikation():
+    res, rep = run_scenarios(OhnePreisindikation(), ["SZ-02", "SZ-03", "SZ-14"])
+    assert {k: v["result"] for k, v in res.items()} == {"SZ-02": "PASS", "SZ-03": "PASS", "SZ-14": "PASS"}, \
+        {k: v["messages"] for k, v in res.items()}
+
+
+class MindestpreisPlattform(MockPlatform):
+    """Behandelt die Preisvorstellung (vertragswidrig) als Mindestpreis: zu teure Angebote werden nicht gekauft."""
+
+    def _settle(self, d):
+        super()._settle(d)
+        for a in self.results[d]["allocations"]:
+            p = self.positions[a["positionId"]]
+            if p.get("priceExpectationEurPerKwh", 0) > self.markets[d]["prices"]["buyPriceEurPerKwh"]:
+                a["allocatedKwh"], a["reason"] = Decimal(0), "NOT_ALLOCATED"
+
+
+def test_sz03_erkennt_preisvorstellung_als_mindestpreis():
+    res, _ = run_scenarios(MindestpreisPlattform(), ["SZ-03"])
+    assert res["SZ-03"]["result"] == "FAIL"
+    assert any("NOT_ALLOCATED" in m for m in res["SZ-03"]["messages"]), res["SZ-03"]["messages"]
+
+
+class IdempotenzOhneSpeicher(MockPlatform):
+    """Ignoriert den Idempotency-Key: Wiederholungen bekommen 409 POSITION_ALREADY_EXISTS statt der gespeicherten 201."""
+
+    def _idempotent(self, ident, key, raw, fn):
+        return fn()
+
+
+def test_sz18_erkennt_fehlende_gespeicherte_antwort():
+    res, _ = run_scenarios(IdempotenzOhneSpeicher(), ["SZ-18"])
+    assert res["SZ-18"]["result"] == "FAIL"
+    assert any("Idempotency-Key" in m for m in res["SZ-18"]["messages"]), res["SZ-18"]["messages"]
 
 
 class OhneIdempotenz(MockPlatform):
@@ -101,9 +145,14 @@ class FalscheReserveAufteilung(MockPlatform):
 
 
 def test_sz15_erkennt_falsche_reserveaufteilung():
-    res, _ = run_scenarios(FalscheReserveAufteilung(), ["SZ-15"])
+    # Gruppe 1: Reserve pro rata auf die Bedarfe
+    res, _ = run_scenarios(FalscheReserveAufteilung(), ["SZ-15"], rule="gruppe1")
     assert res["SZ-15"]["result"] == "FAIL"
     assert any("SELLS_RESERVE" in m for m in res["SZ-15"]["messages"]), res["SZ-15"]["messages"]
+    # ohne Regel: die Aufteilung ist frei, aber die vertauschten Mengen passen nicht mehr zu den Beträgen (Invariante 7)
+    res, _ = run_scenarios(FalscheReserveAufteilung(), ["SZ-15"])
+    assert res["SZ-15"]["result"] == "FAIL"
+    assert any("Invariante 7" in m for m in res["SZ-15"]["messages"]), res["SZ-15"]["messages"]
 
 
 class AlleAngeboteVoll(MockPlatform):
@@ -119,6 +168,8 @@ class AlleAngeboteVoll(MockPlatform):
 def test_sz17_erkennt_ueberbuchung():
     res, _ = run_scenarios(AlleAngeboteVoll(), ["SZ-17"])
     assert res["SZ-17"]["result"] == "FAIL"
+    assert any("Invariante 3" in m for m in res["SZ-17"]["messages"]), res["SZ-17"]["messages"]
+    res, _ = run_scenarios(AlleAngeboteVoll(), ["SZ-17"], rule="gruppe1")
     assert any("allocatedKwh" in m for m in res["SZ-17"]["messages"]), res["SZ-17"]["messages"]
 
 
@@ -135,9 +186,10 @@ class DoppelterTrade(MockPlatform):
 
 
 def test_sz16_und_17_erkennen_doppelte_handelsabschluesse():
-    res, _ = run_scenarios(DoppelterTrade(), ["SZ-16", "SZ-17"])
-    assert res["SZ-16"]["result"] == "FAIL" and res["SZ-17"]["result"] == "FAIL"
-    assert any("Trades im Intervall" in m for m in res["SZ-17"]["messages"]), res["SZ-17"]["messages"]
+    for rule in ("invariants", "gruppe1"):
+        res, _ = run_scenarios(DoppelterTrade(), ["SZ-16", "SZ-17"], rule=rule)
+        assert res["SZ-16"]["result"] == "FAIL" and res["SZ-17"]["result"] == "FAIL", rule
+        assert any("Handelsabschlüsse" in m for m in res["SZ-17"]["messages"]), res["SZ-17"]["messages"]
 
 
 class FalscherAblehnungsgrund(MockPlatform):
@@ -231,6 +283,19 @@ class PreiseAendernSich(MockPlatform):
         self.markets[d]["prices"]["sellPriceEurPerKwh"] += Decimal("0.01")
 
 
+def test_geaenderte_preisindikation_ist_nur_hinweis(monkeypatch):
+    # ab 0.3 ist Market.prices nur eine unverbindliche Indikation: Änderung = Info, kein Fehler
+    p = PreiseAendernSich()
+    srv, raw, d = _setup(p, "DAY", n=3)
+    try:
+        operator_closes(monkeypatch, p)
+        rep = Simulator(parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})).run()
+    finally:
+        srv.shutdown()
+    assert not [f for f in rep["findings"] if f["severity"] == "error"], rep["findings"]
+    assert any("Preisindikation" in f["message"] for f in rep["findings"] if f["severity"] == "info")
+
+
 class UnvollstaendigerMarkt(MockPlatform):
     def _settle(self, d):
         super()._settle(d)
@@ -238,12 +303,12 @@ class UnvollstaendigerMarkt(MockPlatform):
         self.markets[d]["settledAt"] = None
 
 
-@pytest.mark.parametrize("platform_cls,expected", [(PreiseAendernSich, "unverändert"), (UnvollstaendigerMarkt, "failureReason")])
-def test_marktzustand_nach_settlement_wird_geprueft(platform_cls, expected):
+@pytest.mark.parametrize("platform_cls,expected", [(UnvollstaendigerMarkt, "failureReason")])
+def test_marktzustand_nach_settlement_wird_geprueft(platform_cls, expected, monkeypatch):
     p = platform_cls()
     srv, raw, d = _setup(p, "DAY", n=3)
     try:
-        threading.Timer(2, p.close_market, args=(d,)).start()
+        operator_closes(monkeypatch, p)
         rep = Simulator(parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})).run()
     finally:
         srv.shutdown()

@@ -130,6 +130,33 @@
    },
    "roles": []
   },
+  "GET /markets": {
+   "public": false,
+   "responses": {
+    "200": {
+     "items": {
+      "$ref": "#/components/schemas/Market"
+     },
+     "type": "array"
+    },
+    "400": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "500": {
+     "$ref": "#/components/schemas/Error"
+    }
+   },
+   "roles": [
+    "ADMIN",
+    "ENERGY_COMMUNITY"
+   ]
+  },
   "GET /markets/{deliveryDate}": {
    "public": false,
    "responses": {
@@ -140,6 +167,9 @@
      "$ref": "#/components/schemas/Error"
     },
     "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
      "$ref": "#/components/schemas/Error"
     },
     "404": {
@@ -258,6 +288,9 @@
     "401": {
      "$ref": "#/components/schemas/Error"
     },
+    "403": {
+     "$ref": "#/components/schemas/Error"
+    },
     "500": {
      "$ref": "#/components/schemas/Error"
     }
@@ -336,6 +369,9 @@
     "403": {
      "$ref": "#/components/schemas/Error"
     },
+    "429": {
+     "$ref": "#/components/schemas/Error"
+    },
     "500": {
      "$ref": "#/components/schemas/Error"
     }
@@ -347,6 +383,9 @@
    "responses": {
     "204": null,
     "401": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "403": {
      "$ref": "#/components/schemas/Error"
     },
     "500": {
@@ -368,6 +407,9 @@
      "$ref": "#/components/schemas/Error"
     },
     "409": {
+     "$ref": "#/components/schemas/Error"
+    },
+    "429": {
      "$ref": "#/components/schemas/Error"
     },
     "500": {
@@ -450,9 +492,6 @@
      "$ref": "#/components/schemas/Error"
     },
     "409": {
-     "$ref": "#/components/schemas/Error"
-    },
-    "422": {
      "$ref": "#/components/schemas/Error"
     },
     "500": {
@@ -590,11 +629,11 @@
    "type": "object"
   },
   "AllocationReason": {
-   "description": "Warum die Zuteilung so ausfällt (Vorschlag). FULLY_ALLOCATED: volle Menge. PARTIALLY_ALLOCATED: Angebot pro rata gekürzt, weil handelbare Angebote den Bedarf übersteigen. PRICE_NOT_MET: Preisvorstellung über buyPriceEurPerKwh, nicht gehandelt. NOT_NEEDED: kein Bedarf vorhanden. RESERVE_SHORTAGE: Bedarf gekürzt, weil die Reserve nicht reicht.",
+   "description": "FULLY_ALLOCATED: volle Menge. PARTIALLY_ALLOCATED: Angebot wegen Überangebot nur teilweise gekauft. NOT_ALLOCATED: Angebot wegen Überangebot gar nicht gekauft (nach der Zuteilungsregel der Plattform). NOT_NEEDED: es gab keinen Bedarf. RESERVE_SHORTAGE: Bedarf gekürzt, weil die Reserve nicht reichte.",
    "enum": [
     "FULLY_ALLOCATED",
     "PARTIALLY_ALLOCATED",
-    "PRICE_NOT_MET",
+    "NOT_ALLOCATED",
     "NOT_NEEDED",
     "RESERVE_SHORTAGE"
    ],
@@ -603,6 +642,16 @@
   "AmountEur": {
    "type": "number",
    "x-maxDecimals": 2
+  },
+  "CommunityCode": {
+   "description": "Plattformübergreifende Kennung der EG (Vorschlag). Unveränderlich, pro Plattform eindeutig.",
+   "examples": [
+    "eg-mmm"
+   ],
+   "maxLength": 40,
+   "minLength": 3,
+   "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+   "type": "string"
   },
   "Credentials": {
    "properties": {
@@ -629,6 +678,9 @@
   },
   "EnergyCommunity": {
    "properties": {
+    "communityCode": {
+     "$ref": "#/components/schemas/CommunityCode"
+    },
     "createdAt": {
      "$ref": "#/components/schemas/Timestamp"
     },
@@ -656,6 +708,7 @@
    "required": [
     "id",
     "email",
+    "communityCode",
     "name",
     "status",
     "createdAt",
@@ -674,6 +727,9 @@
   "EnergyCommunityRegistration": {
    "additionalProperties": false,
    "properties": {
+    "communityCode": {
+     "$ref": "#/components/schemas/CommunityCode"
+    },
     "description": {
      "maxLength": 500,
      "minLength": 1,
@@ -693,6 +749,7 @@
    },
    "required": [
     "email",
+    "communityCode",
     "name"
    ],
    "type": "object"
@@ -719,7 +776,7 @@
   },
   "EnergyCommunityUpdate": {
    "additionalProperties": false,
-   "description": "Profil bearbeiten. Der Status ist hier nicht erlaubt (nur PUT /energy-communities/{id}/status).",
+   "description": "Profil bearbeiten. status und communityCode sind hier nicht erlaubt (400 VALIDATION_FAILED).",
    "minProperties": 1,
    "properties": {
     "description": {
@@ -767,11 +824,16 @@
     },
     "message": {
      "type": "string"
+    },
+    "requestId": {
+     "description": "Gleicher Wert wie der Antwort-Header X-Request-Id.",
+     "type": "string"
     }
    },
    "required": [
     "code",
-    "message"
+    "message",
+    "requestId"
    ],
    "type": "object"
   },
@@ -792,13 +854,15 @@
     "POSITION_NOT_FOUND",
     "MARKET_NOT_FOUND",
     "EMAIL_ALREADY_REGISTERED",
+    "COMMUNITY_CODE_ALREADY_REGISTERED",
     "ENERGY_COMMUNITY_IN_USE",
     "INVALID_STATUS_TRANSITION",
     "POSITION_ALREADY_EXISTS",
     "POSITION_NOT_MODIFIABLE",
+    "IDEMPOTENCY_KEY_REUSED",
     "MARKET_CLOSED",
     "MARKET_NOT_SETTLED",
-    "DELIVERY_DATE_IN_PAST",
+    "RATE_LIMITED",
     "INTERNAL_ERROR"
    ],
    "type": "string"
@@ -842,25 +906,21 @@
      "$ref": "#/components/schemas/Reserve"
     },
     "totalDemandKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     },
     "totalOfferedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     },
     "totalPurchasedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     },
     "totalSoldKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
-    },
-    "tradableOfferedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     }
    },
    "required": [
     "intervalStart",
     "totalOfferedKwh",
-    "tradableOfferedKwh",
     "totalDemandKwh",
     "totalPurchasedKwh",
     "totalSoldKwh",
@@ -955,7 +1015,7 @@
     },
     "closesAt": {
      "$ref": "#/components/schemas/Timestamp",
-     "description": "Ab diesem Zeitpunkt werden keine Positionen mehr angenommen, geändert oder storniert."
+     "description": "Ab diesem Zeitpunkt werden keine Positionen mehr angenommen, geändert oder storniert. Realer Zeitpunkt, unabhängig vom deliveryDate (bei historischen Liefertagen liegt er danach)."
     },
     "deliveryDate": {
      "$ref": "#/components/schemas/DeliveryDate"
@@ -968,8 +1028,8 @@
      ]
     },
     "prices": {
-     "$ref": "#/components/schemas/Prices",
-     "description": "Ab Marktöffnung bekannt und bis zum Settlement unverändert (Vorschlag)."
+     "$ref": "#/components/schemas/PriceIndication",
+     "description": "Optional: Preisindikation vor Marktschluss (nicht verbindlich)."
     },
     "resolution": {
      "$ref": "#/components/schemas/MarketResolution"
@@ -992,13 +1052,12 @@
     "deliveryDate",
     "resolution",
     "status",
-    "prices",
     "closesAt"
    ],
    "type": "object"
   },
   "MarketResolution": {
-   "description": "Zeitliche Auflösung des Markts (Vorschlag). DAY = ein Intervall pro Liefertag, QUARTER_HOUR = 15-Minuten-Intervalle.",
+   "description": "Zeitliche Auflösung des Markts. DAY = Tagesmarkt (verbindlicher Standard), QUARTER_HOUR = 15-Minuten-Intervalle (optionale Erweiterung).",
    "enum": [
     "DAY",
     "QUARTER_HOUR"
@@ -1022,7 +1081,8 @@
      "description": "salesRevenueEur - purchaseCostEur - reserve.costEur"
     },
     "prices": {
-     "$ref": "#/components/schemas/Prices"
+     "$ref": "#/components/schemas/Prices",
+     "description": "Durchschnittspreise des Tages (siehe Prices)."
     },
     "purchaseCostEur": {
      "$ref": "#/components/schemas/AmountEur"
@@ -1032,6 +1092,14 @@
     },
     "resolution": {
      "$ref": "#/components/schemas/MarketResolution"
+    },
+    "ruleVersion": {
+     "description": "Optional: Version der Preis- und Zuteilungsregel der Plattform, mit der gerechnet wurde.",
+     "examples": [
+      "gruppe1-prorata-1.0"
+     ],
+     "maxLength": 64,
+     "type": "string"
     },
     "salesRevenueEur": {
      "$ref": "#/components/schemas/AmountEur"
@@ -1043,20 +1111,18 @@
      "$ref": "#/components/schemas/MarketStatus"
     },
     "totalDemandKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal",
+     "description": "D: Summe aller Bedarfe, die beim Marktschluss CLOSED wurden (nach dem Settlement PROCESSED)."
     },
     "totalOfferedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal",
+     "description": "S: Summe aller Angebote, die beim Marktschluss CLOSED wurden (nach dem Settlement PROCESSED)."
     },
     "totalPurchasedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     },
     "totalSoldKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
-    },
-    "tradableOfferedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative",
-     "description": "Summe der Angebote, deren Preisvorstellung erfüllt ist (S)."
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     }
    },
    "required": [
@@ -1065,7 +1131,6 @@
     "status",
     "settledAt",
     "totalOfferedKwh",
-    "tradableOfferedKwh",
     "totalDemandKwh",
     "totalPurchasedKwh",
     "totalSoldKwh",
@@ -1191,7 +1256,7 @@
     },
     "priceExpectationEurPerKwh": {
      "$ref": "#/components/schemas/PriceEurPerKwh",
-     "description": "Nur bei OFFER: Mindestpreis, zu dem die EG verkauft. Liegt er über buyPriceEurPerKwh, wird das Angebot nicht gehandelt."
+     "description": "Nur bei OFFER, optional und nur informativ. Kein Mindestpreis."
     },
     "quantityKwh": {
      "$ref": "#/components/schemas/QuantityKwh"
@@ -1233,7 +1298,7 @@
   },
   "PositionUpdate": {
    "additionalProperties": false,
-   "description": "Der Server prüft den Typ der bereits gespeicherten Position: priceExpectationEurPerKwh ist nur bei OFFER zulässig. Bei DEMAND und übergebenem Preisfeld: 400 VALIDATION_FAILED; die Position bleibt unverändert. Diese Regel hängt von der gespeicherten Ressource ab und kann nicht allein durch das Request-Schema validiert werden.",
+   "description": "Ersetzt Menge und Preisvorstellung. Fehlt priceExpectationEurPerKwh, hat die Position danach keine. priceExpectationEurPerKwh ist nur bei einer gespeicherten OFFER-Position zulässig; bei DEMAND mit diesem Feld: 400 VALIDATION_FAILED, die Position bleibt unverändert.",
    "properties": {
     "priceExpectationEurPerKwh": {
      "$ref": "#/components/schemas/PriceEurPerKwh"
@@ -1256,7 +1321,8 @@
    "type": "number",
    "x-maxDecimals": 5
   },
-  "Prices": {
+  "PriceIndication": {
+   "description": "Optionale Preisindikation vor Marktschluss, nicht verbindlich. Plattformen mit festen Preisen geben hier ihre festen Preise an.",
    "properties": {
     "buyPriceEurPerKwh": {
      "$ref": "#/components/schemas/PriceEurPerKwh"
@@ -1269,6 +1335,51 @@
     },
     "sellPriceEurPerKwh": {
      "$ref": "#/components/schemas/PriceEurPerKwh"
+    }
+   },
+   "required": [
+    "deliveryDate",
+    "buyPriceEurPerKwh",
+    "sellPriceEurPerKwh",
+    "reservePriceEurPerKwh"
+   ],
+   "type": "object"
+  },
+  "Prices": {
+   "description": "Durchschnittspreise des Liefertags, gewichtet nach Menge. null, wenn es in dieser Richtung kein Geschäft bzw. keine Reserve gab.",
+   "properties": {
+    "buyPriceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "deliveryDate": {
+     "$ref": "#/components/schemas/DeliveryDate"
+    },
+    "reservePriceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "sellPriceEurPerKwh": {
+     "oneOf": [
+      {
+       "$ref": "#/components/schemas/PriceEurPerKwh"
+      },
+      {
+       "type": "null"
+      }
+     ]
     }
    },
    "required": [
@@ -1294,6 +1405,12 @@
    "type": "number",
    "x-maxDecimals": 3
   },
+  "QuantityKwhTotal": {
+   "description": "Summe über mehrere Positionen; ohne Obergrenze.",
+   "minimum": 0,
+   "type": "number",
+   "x-maxDecimals": 3
+  },
   "Reserve": {
    "properties": {
     "costEur": {
@@ -1303,7 +1420,7 @@
      "$ref": "#/components/schemas/DeliveryDate"
     },
     "dispatchedKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative"
+     "$ref": "#/components/schemas/QuantityKwhTotal"
     },
     "priceEurPerKwh": {
      "oneOf": [
@@ -1316,8 +1433,8 @@
      ]
     },
     "requiredKwh": {
-     "$ref": "#/components/schemas/QuantityKwhNonNegative",
-     "description": "max(D - S, 0), S = Summe der handelbaren Angebote."
+     "$ref": "#/components/schemas/QuantityKwhTotal",
+     "description": "max(D - S, 0)"
     },
     "status": {
      "$ref": "#/components/schemas/ReserveStatus"
@@ -1414,5 +1531,5 @@
    "type": "string"
   }
  },
- "version": "0.2.0"
+ "version": "0.3.1"
 }

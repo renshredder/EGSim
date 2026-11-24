@@ -23,7 +23,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from egsim import CONTRACT_VERSION, __version__
 from egsim.client import RequestStats, _to_jsonable
-from egsim.config import (PROFILES, ConfigError, default_config_dict, load_config_dict, new_community_dict,
+from egsim.config import (COMMUNITY_CODE_RE, PROFILES, ConfigError, community_code_from, default_config_dict,
+                          load_config_dict, new_community_dict,
                           parse_config)
 
 log = logging.getLogger("egsim.ui")
@@ -185,6 +186,7 @@ MANUAL_ACTIONS = {
     "me": ("GET", "/me"),
     "getCommunity": ("GET", "/energy-communities/{ecId}"),
     "updateCommunity": ("PUT", "/energy-communities/{ecId}"),
+    "markets": ("GET", "/markets"),
     "market": ("GET", "/markets/{date}"),
     "listPositions": ("GET", "/positions"),
     "getPosition": ("GET", "/positions/{id}"),
@@ -239,8 +241,17 @@ def manual_request(state: UiState, payload: dict) -> dict:
         except KeyError as exc:
             return {"error": f"Parameter fehlt: {exc}"}
     raw_body = body if isinstance(body, str) else None
-    r = client.call(method, path, json_body=None if raw_body is not None else body, raw_body=raw_body, params=query)
-    return {"method": method, "path": path, "query": query or None, "request": _to_jsonable(body) if raw_body is None else raw_body,
+    headers = {}
+    idem = (payload.get("idempotencyKey") or "").strip()
+    if method == "POST" and template == "/positions" and not payload.get("noIdempotencyKey"):
+        idem = idem or str(uuid.uuid4())  # Pflicht ab Vertrag 0.3; zum Testen abschaltbar
+    if idem:
+        headers["Idempotency-Key"] = idem
+    r = client.call(method, path, json_body=None if raw_body is not None else body, raw_body=raw_body, params=query,
+                    headers=headers or None)
+    return {"method": method, "path": path, "query": query or None, "idempotencyKey": idem or None,
+            "requestId": r.response_request_id,
+            "request": _to_jsonable(body) if raw_body is None else raw_body,
             "status": r.status, "ms": round(r.elapsed_ms, 1), "response": _to_jsonable(r.body), "error": r.error}
 
 
@@ -393,11 +404,17 @@ def make_handler(state: UiState, password: str | None = None, user: str = "egsim
                 email = (raw.get("email") or "").strip()
                 if not email:
                     raise ValueError("Für die Registrierung eine E-Mail-Adresse eintragen")
-                r = register_community(cfg.base_url, raw.get("name", "").strip(), email, raw.get("description") or None,
+                code = (raw.get("communityCode") or "").strip() or community_code_from(raw.get("name", ""))
+                if not COMMUNITY_CODE_RE.match(code) or not 3 <= len(code) <= 40:
+                    raise ValueError(f"communityCode '{code}' ungültig (Kleinbuchstaben, Ziffern, einzelne Bindestriche, "
+                                     "3–40 Zeichen)")
+                r = register_community(cfg.base_url, raw.get("name", "").strip(), email, code,
+                                       raw.get("description") or None,
                                        timeout=cfg.timeout, verify_tls=cfg.verify_tls, stats=state.manual_stats)
                 if r.status == 201 and isinstance(r.body, dict) and r.body.get("id"):
                     with state.lock:
                         raw["energyCommunityId"] = r.body["id"]
+                        raw["communityCode"] = r.body.get("communityCode") or code
                         raw["registeredStatus"] = r.body.get("status")
                         state.save()
                 self._send(200, {"status": r.status, "response": _to_jsonable(r.body), "error": r.error,
@@ -434,16 +451,17 @@ def make_handler(state: UiState, password: str | None = None, user: str = "egsim
             from egsim.timeutil import now_utc, resolve_delivery_date
             m = state.mock
             if p == ["markets"] and method == "GET":
-                self._send(200, list(m.markets.values()))
+                self._send(200, [m._market_public(x) for x in m.markets.values()])
             elif p == ["markets"] and method == "POST":
                 d = resolve_delivery_date(body.get("date") or "tomorrow").isoformat()
                 closes = now_utc() + timedelta(minutes=float(body.get("closesInMinutes") or 60))
                 mk = m.add_market(d, body.get("resolution") or "DAY", str(body.get("buy") or "0.10"),
-                                  str(body.get("sell") or "0.14"), str(body.get("reserve") or "0.20"), closes)
-                self._send(200, mk)
+                                  str(body.get("sell") or "0.14"), str(body.get("reserve") or "0.20"), closes,
+                                  show_prices=body.get("showPrices", True) is not False)
+                self._send(200, m._market_public(mk))
             elif len(p) == 3 and p[0] == "markets" and p[2] == "close" and method == "POST":
                 status, mk = m.close_market(resolve_delivery_date(p[1]).isoformat())
-                self._send(200, {"httpStatus": status, "market": mk})
+                self._send(200, {"httpStatus": status, "market": m._market_public(mk)})
             elif p == ["reserve"] and method == "PUT":
                 cap = body.get("capacityKwh")
                 m.reserve_capacity = Decimal(str(cap)) if cap not in (None, "") else None
@@ -538,7 +556,8 @@ def mock_config(url: str, egs: list[dict]) -> dict:
     from egsim.scenarios import CATALOG
     cfg["run"]["scenarios"] = [sc.id for sc in CATALOG]
     cfg["communities"] = [new_community_dict(e["name"], email=e["email"], apiKey=e["apiKey"], password=e["password"],
-                                             energyCommunityId=e["id"], **flows[i % len(flows)])
+                                             energyCommunityId=e["id"], communityCode=e.get("communityCode", ""),
+                                             **flows[i % len(flows)])
                           for i, e in enumerate(egs)]
     return cfg
 

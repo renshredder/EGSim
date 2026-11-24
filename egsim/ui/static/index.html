@@ -130,7 +130,7 @@
         <label class="f"><span>Admin-Checks</span><div><input type="checkbox" data-path="run.adminChecks" data-type="bool"> <small>Statuswechsel, Sperren, Löschen mit einer Wegwerf-EG</small></div></label>
 
         <h2 style="margin-top:20px">Markt &amp; Ablauf</h2>
-        <label class="f"><span>Liefertage</span><div><input data-path="run.deliveryDates" data-type="list" placeholder="tomorrow, +2, 2026-11-20"><small>today, tomorrow, +N oder JJJJ-MM-TT, mit Komma getrennt. Der Markt muss existieren.</small></div></label>
+        <label class="f"><span>Liefertage</span><div><input data-path="run.deliveryDates" data-type="list" placeholder="tomorrow, +2, 2026-11-20"><small>today, tomorrow, +N, -N oder JJJJ-MM-TT, mit Komma getrennt; „open“ = alle offenen Märkte (GET /markets?status=OPEN). Historische Liefertage sind erlaubt, der Markt muss existieren.</small></div></label>
         <label class="f"><span>Positionen einreichen</span><input type="checkbox" data-path="run.submitPositions" data-type="bool"></label>
         <label class="f"><span>Bestehende Position</span><select data-path="run.onExistingPosition"><option value="skip">überspringen</option><option value="update">mit neuen Werten aktualisieren</option></select></label>
         <label class="f"><span>Auf Settlement warten</span><div class="row"><input type="number" min="0" step="1" data-path="run.waitForSettlementMinutes" data-type="num"><span class="muted">Minuten</span></div></label>
@@ -150,7 +150,9 @@
         <label class="f"><span>Negativtests</span><div><input type="checkbox" data-path="run.checks" data-type="bool"> <small>Fehlercodes, Rollen, Mandantentrennung, Validierung</small></div></label>
         <label class="f"><span>Schema-Prüfung</span><div><input type="checkbox" data-path="run.validateSchema" data-type="bool"> <small>jede Antwort gegen die Schemas des Datenvertrags (Pflichtfelder, Typen, Formate, Fehlerformat)</small></div></label>
         <label class="f"><span>Registrierungstests</span><div><input type="checkbox" data-path="run.registrationChecks" data-type="bool"> <small>legt eine PENDING-Test-EG auf der Plattform an</small></div></label>
+        <label class="f"><span>Rate-Limit-Test</span><div><input type="checkbox" data-path="run.rateLimitChecks" data-type="bool"> <small>Login-Fehlversuche bis 429 RATE_LIMITED (sperrt ggf. Logins von dieser Adresse kurz)</small></div></label>
         <label class="f"><span>Ergebnisse prüfen</span><input type="checkbox" data-path="run.verifyResults" data-type="bool"></label>
+        <label class="f"><span>Zuteilungsregel</span><div><select data-path="run.allocationRule"><option value="invariants">nur verbindliche Invarianten (jede Plattform)</option><option value="gruppe1">Referenz Gruppe 1 (feste Preise, pro rata) exakt nachrechnen</option></select><small>Seit Vertrag 0.3 hat jede Plattform ihre eigene Preis- und Zuteilungsregel. „Gruppe 1“ nur für Plattformen wählen, die genau so rechnen.</small></div></label>
         <label class="f"><span>Nur simulierte EGs am Markt</span><div><input type="checkbox" data-path="run.allParticipantsSimulated" data-type="bool"> <small>dann rechnet EGSim das Matching komplett nach</small></div></label>
         <label class="f"><span>Toleranz</span><div class="row"><input type="number" min="0" step="0.001" data-path="run.tolerance.kwh" data-type="num"><span class="muted">kWh</span><input type="number" min="0" step="0.01" data-path="run.tolerance.eur" data-type="num"><span class="muted">EUR</span></div></label>
       </div>
@@ -196,7 +198,7 @@
       Ergebnisse gibt es erst nach dem Settlement: Wartezeit setzen oder mit Admin-Key „Markt selbst schließen“.
     </div>
     <div class="panel">
-      <label class="f"><span>Liefertage für Szenarien</span><div><input data-path="run.scenarioDates" data-type="list" placeholder="leer = Liefertage aus „Lauf“"><small>z. B. +2 für einen 15-Minuten-Markt übermorgen</small></div></label>
+      <label class="f"><span>Liefertage für Szenarien</span><div><input data-path="run.scenarioDates" data-type="list" placeholder="leer = Liefertage aus „Lauf“"><small>z. B. +2 für einen 15-Minuten-Markt übermorgen oder „open“ für alle offenen Märkte</small></div></label>
       <div class="toolbar" style="margin-top:10px">
         <label><input type="checkbox" id="scAll"> alle</label>
         <span class="spacer"></span>
@@ -216,6 +218,7 @@
         <label class="f"><span>EG</span><select id="mEg"></select></label>
         <label class="f"><span>Aktion</span><select id="mAction">
           <option value="me">GET /me – eigene Rolle und EG</option>
+          <option value="markets">GET /markets – alle Märkte</option>
           <option value="market">GET /markets/{deliveryDate}</option>
           <option value="submitPosition">POST /positions – Angebot/Bedarf</option>
           <option value="listPositions">GET /positions</option>
@@ -431,6 +434,7 @@ function renderEgs() {
         <div>
           <h3>Zugang</h3>
           <label class="f"><span>E-Mail</span><input type="email" data-eg="${c.uid}" data-f="email" value="${esc(c.email)}" placeholder="kontakt@eg.example"></label>
+          <label class="f"><span>communityCode</span><input class="mono" data-eg="${c.uid}" data-f="communityCode" value="${esc(c.communityCode || "")}" placeholder="${esc(codeFrom(c.name))}" pattern="[a-z0-9]+(-[a-z0-9]+)*" title="3–40 Zeichen: Kleinbuchstaben, Ziffern, einzelne Bindestriche. Auf allen Plattformen derselbe, nach der Registrierung unveränderlich. Leer = Vorschlag aus dem Namen."></label>
           <label class="f"><span>Beschreibung</span><input data-eg="${c.uid}" data-f="description" value="${esc(c.description)}"></label>
           <label class="f"><span>Anmeldung</span><select data-eg="${c.uid}" data-f="auth"><option value="apiKey" ${c.auth !== "bearer" ? "selected" : ""}>API-Key (X-API-Key)</option><option value="bearer" ${c.auth === "bearer" ? "selected" : ""}>E-Mail + Passwort (Bearer-Token)</option></select></label>
           <label class="f"><span>API-Key</span><input type="password" autocomplete="off" data-eg="${c.uid}" data-f="apiKey" value="${esc(c.apiKey)}" placeholder="vom Admin übergeben"></label>
@@ -707,6 +711,12 @@ $("#btnScenarios").onclick = async () => {
   showTab("run"); await startRun("scenarios");
 };
 
+function codeFrom(name) {
+  const t = String(name || "").toLowerCase().replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue").replace(/ß/g, "ss")
+    .normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "");
+  return t.length >= 3 ? t : (t + "-eg").replace(/^-/, "");
+}
+
 // ---------------------------------------------------------------- Manuell
 function isoDate(spec) {
   const s = String(spec || "tomorrow").trim().toLowerCase();
@@ -722,7 +732,7 @@ const TEMPLATES = {
   updateCommunity: () => ({ description: "Geändert über EGSim" }),
 };
 const NEEDS = {
-  me: [], getCommunity: [], updateCommunity: ["body"], market: ["date"], submitPosition: ["body"],
+  me: [], getCommunity: [], updateCommunity: ["body"], markets: ["query:status"], market: ["date"], submitPosition: ["body", "idem"],
   listPositions: ["query:deliveryDate,intervalStart,type,status,energyCommunityId"], getPosition: ["id"], updatePosition: ["id", "body"],
   cancelPosition: ["id"], allocations: ["date", "query:intervalStart,energyCommunityId"], trades: ["date", "query:direction,intervalStart,positionId,energyCommunityId"],
   raw: ["method", "path", "body", "query:"],
@@ -739,6 +749,7 @@ function renderManualFields() {
   let h = "";
   for (const n of needs) {
     if (n === "date") h += `<label class="f"><span>deliveryDate</span><input id="mDate" value="${esc(date)}"></label>`;
+    if (n === "idem") h += `<label class="f"><span>Idempotency-Key</span><div><input id="mIdem" class="mono" placeholder="leer = neue UUID je Request"><small><label><input type="checkbox" id="mNoIdem"> ohne Header senden (Plattform muss 400 liefern)</label> – gleicher Key + gleicher Body liefert die gespeicherte Antwort</small></div></label>`;
     if (n === "id") h += `<label class="f"><span>Positions-ID</span><input id="mId" class="mono" placeholder="UUID"></label>`;
     if (n === "method") h += `<label class="f"><span>Methode</span><select id="mMethod"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option></select></label>`;
     if (n === "path") h += `<label class="f"><span>Pfad</span><input id="mPath" class="mono" value="/positions"></label>`;
@@ -757,13 +768,13 @@ $("#mSend").onclick = async () => {
   const a = $("#mAction").value;
   const query = {};
   ($("#mQuery")?.value || "").split("\n").forEach(l => { const i = l.indexOf("="); if (i > 0) { const v = l.slice(i + 1).trim(); if (v) query[l.slice(0, i).trim()] = v; } });
-  const payload = { uid: $("#mEg").value, action: a, params: { date: $("#mDate")?.value, id: $("#mId")?.value }, body: $("#mBody")?.value, query, method: $("#mMethod")?.value, path: $("#mPath")?.value };
+  const payload = { uid: $("#mEg").value, action: a, params: { date: $("#mDate")?.value, id: $("#mId")?.value }, body: $("#mBody")?.value, query, method: $("#mMethod")?.value, path: $("#mPath")?.value, idempotencyKey: $("#mIdem")?.value, noIdempotencyKey: !!$("#mNoIdem")?.checked };
   $("#mInfo").textContent = "sende …";
   try {
     const r = await api("POST", "/api/manual", payload);
     $("#mInfo").textContent = "";
     if (r.error && !r.status) { $("#mResult").innerHTML = `<span class="chip err">Fehler</span> ${esc(r.error)}`; return; }
-    $("#mResult").innerHTML = `<div class="kv"><div>Request</div><div class="mono">${esc(r.method)} ${esc(r.path)}${r.query ? "?" + esc(new URLSearchParams(r.query).toString()) : ""}</div><div>Status</div><div class="status-${String(r.status)[0]}">${r.status || esc(r.error)}</div><div>Dauer</div><div>${r.ms} ms</div></div>
+    $("#mResult").innerHTML = `<div class="kv"><div>Request</div><div class="mono">${esc(r.method)} ${esc(r.path)}${r.query ? "?" + esc(new URLSearchParams(r.query).toString()) : ""}</div><div>Status</div><div class="status-${String(r.status)[0]}">${r.status || esc(r.error)}</div><div>Dauer</div><div>${r.ms} ms</div>${r.idempotencyKey ? `<div>Idempotency-Key</div><div class="mono">${esc(r.idempotencyKey)}</div>` : ""}${r.requestId ? `<div>X-Request-Id</div><div class="mono">${esc(r.requestId)}</div>` : ""}</div>
       <pre class="json">${r.response != null ? fmtJson(r.response) : "(leer)"}</pre>`;
     const id = r.response && r.response.id; if (id && $("#mId") === null && a === "submitPosition") $("#mInfo").textContent = "Positions-ID: " + id;
   } catch (e) { $("#mInfo").textContent = ""; $("#mResult").innerHTML = `<span class="chip err">Fehler</span> ${esc(e.message)}`; }
@@ -772,7 +783,7 @@ $("#mSend").onclick = async () => {
 // ------------------------------------------------------------------- Mock
 async function loadMockMarkets() {
   const ms = await api("GET", "/api/mock/markets");
-  $("#mkList").innerHTML = ms.map(m => `<tr><td>${esc(m.deliveryDate)}</td><td>${esc(m.resolution)}</td><td><span class="chip ${m.status === "SETTLED" ? "ok" : m.status === "OPEN" ? "info" : "warn"}">${esc(m.status)}</span></td><td class="mono">${esc(m.closesAt)}</td><td>${esc(m.prices.buyPriceEurPerKwh)} / ${esc(m.prices.sellPriceEurPerKwh)} / ${esc(m.prices.reservePriceEurPerKwh)}</td><td>${m.status === "OPEN" || m.status === "FAILED" ? `<button class="b" data-close="${esc(m.deliveryDate)}">jetzt schließen</button>` : ""}</td></tr>`).join("");
+  $("#mkList").innerHTML = ms.map(m => `<tr><td>${esc(m.deliveryDate)}</td><td>${esc(m.resolution)}</td><td><span class="chip ${m.status === "SETTLED" ? "ok" : m.status === "OPEN" ? "info" : "warn"}">${esc(m.status)}</span></td><td class="mono">${esc(m.closesAt)}</td><td>${m.prices ? `${esc(m.prices.buyPriceEurPerKwh)} / ${esc(m.prices.sellPriceEurPerKwh)} / ${esc(m.prices.reservePriceEurPerKwh)}` : `<span class="muted">keine Preisindikation</span>`}</td><td>${m.status === "OPEN" || m.status === "FAILED" ? `<button class="b" data-close="${esc(m.deliveryDate)}">jetzt schließen</button>` : ""}</td></tr>`).join("");
   $$("#mkList [data-close]").forEach(b => b.onclick = async () => { await api("POST", `/api/mock/markets/${b.dataset.close}/close`, {}); loadMockMarkets(); });
 }
 $("#mkAdd").onclick = async () => { try { await api("POST", "/api/mock/markets", { date: $("#mkDate").value || "+3", resolution: $("#mkRes").value, closesInMinutes: $("#mkMin").value }); loadMockMarkets(); } catch (e) { alert(e.message); } };

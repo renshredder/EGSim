@@ -1,4 +1,4 @@
-"""Referenzlogik gegen die Beispiele aus dem Datenvertrag 0.2."""
+"""Referenzlogik (Referenzbeispiel Gruppe 1) gegen die Beispiele aus dem Datenvertrag 0.3.1."""
 from decimal import Decimal as D
 
 from egsim.settlement import Pos, Prices, pro_rata, settle
@@ -11,21 +11,48 @@ def pos(pid, typ, qty, created, price=None, ec=None, interval=None):
 
 
 def test_beispielablauf_aus_dem_vertrag():
-    # Sonnenfeld 100 kWh zu 0,08, Windpark 50 kWh zu 0,12 (zu teuer), Altstadt Bedarf 130 kWh
+    # Vertrag 0.3: Sonnenfeld 100 kWh, Windpark 50 kWh zu 0,12 (über dem Ankaufspreis, trotzdem gehandelt),
+    # Altstadt Bedarf 170 kWh, Reserve 20 kWh
     r = settle([
-        pos("a", "OFFER", 100, "2026-11-18T09:00:00Z", "0.08"),
+        pos("a", "OFFER", 100, "2026-11-18T09:00:00Z"),
         pos("b", "OFFER", 50, "2026-11-18T09:20:00Z", "0.12"),
-        pos("c", "DEMAND", 130, "2026-11-18T09:40:00Z"),
+        pos("c", "DEMAND", 170, "2026-11-18T09:40:00Z"),
     ], PRICES, "DAY")
     alloc = {a.position.id: (a.allocated, a.reason) for a in r.allocations}
-    assert alloc == {"a": (100, "FULLY_ALLOCATED"), "b": (0, "PRICE_NOT_MET"), "c": (130, "FULLY_ALLOCATED")}
+    assert alloc == {"a": (100, "FULLY_ALLOCATED"), "b": (50, "FULLY_ALLOCATED"), "c": (170, "FULLY_ALLOCATED")}
     trades = sorted((t.position.id, t.direction, t.from_reserve, t.quantity, t.amount) for t in r.trades)
     assert trades == [("a", "PLATFORM_BUYS", False, 100, D("10.00")),
-                      ("c", "PLATFORM_SELLS", False, 100, D("14.00")),
-                      ("c", "PLATFORM_SELLS", True, 30, D("4.20"))]
-    assert (r.total_offered, r.tradable_offered, r.total_demand, r.total_purchased, r.total_sold) == (150, 100, 130, 100, 130)
-    assert (r.reserve.status, r.reserve.required, r.reserve.dispatched, r.reserve.cost) == ("COVERED", 30, 30, D("6.00"))
-    assert (r.purchase_cost, r.sales_revenue, r.margin) == (D("10.00"), D("18.20"), D("2.20"))
+                      ("b", "PLATFORM_BUYS", False, 50, D("5.00")),
+                      ("c", "PLATFORM_SELLS", False, 150, D("21.00")),
+                      ("c", "PLATFORM_SELLS", True, 20, D("2.80"))]
+    assert (r.total_offered, r.total_demand, r.total_purchased, r.total_sold) == (150, 170, 150, 170)
+    assert (r.reserve.status, r.reserve.required, r.reserve.dispatched, r.reserve.cost) == ("COVERED", 20, 20, D("4.00"))
+    assert (r.purchase_cost, r.sales_revenue, r.margin) == (D("15.00"), D("23.80"), D("4.80"))
+    # MarketResult.prices: Durchschnittspreise
+    assert (r.avg_buy, r.avg_sell, r.avg_reserve) == (D("0.10"), D("0.14"), D("0.20"))
+
+
+def test_hohe_preisvorstellung_wird_gehandelt():
+    # Preisvorstellung ist nur informativ, kein Mindestpreis
+    r = settle([pos("o", "OFFER", 10, "2026-11-18T09:00:00Z", "5.00"), pos("d", "DEMAND", 10, "2026-11-18T09:01:00Z")],
+               PRICES, "DAY")
+    assert next(a for a in r.allocations if a.position.id == "o").reason == "FULLY_ALLOCATED"
+
+
+def test_ueberangebot_not_allocated_bei_anteil_null():
+    # 0,001 kWh Bedarf auf drei Angebote: nur das älteste bekommt den Rest, die anderen gehen leer aus
+    r = settle([pos("a", "OFFER", 1, "2026-11-18T09:00:00Z"), pos("b", "OFFER", 1, "2026-11-18T09:01:00Z"),
+                pos("c", "OFFER", 1, "2026-11-18T09:02:00Z"), pos("d", "DEMAND", "0.001", "2026-11-18T09:03:00Z")],
+               PRICES, "DAY")
+    alloc = {a.position.id: (a.allocated, a.reason) for a in r.allocations}
+    assert alloc["a"] == (D("0.001"), "PARTIALLY_ALLOCATED")
+    assert alloc["b"] == (0, "NOT_ALLOCATED") and alloc["c"] == (0, "NOT_ALLOCATED")
+    assert not [t for t in r.trades if t.position.id in ("b", "c")]
+
+
+def test_keine_geschaefte_durchschnittspreise_null():
+    r = settle([pos("a", "OFFER", 10, "2026-11-18T09:00:00Z")], PRICES, "DAY")
+    assert (r.avg_buy, r.avg_sell, r.avg_reserve) == (None, None, None)
 
 
 def test_teilzuteilung_pro_rata():
@@ -44,14 +71,16 @@ def test_viertelstunden_beispiel_tagesergebnis():
         pos("o2", "OFFER", "1.0", "2026-11-18T09:01:00Z", "0.12", interval=i2),
         pos("d2", "DEMAND", "1.8", "2026-11-18T09:02:00Z", interval=i2),
     ], PRICES, "QUARTER_HOUR")
-    assert (r.total_offered, r.tradable_offered, r.total_demand) == (D("3.5"), D("2.5"), D("3.0"))
+    assert (r.total_offered, r.total_demand) == (D("3.5"), D("3.0"))
     assert (r.total_purchased, r.total_sold) == (D("1.8"), D("3.0"))
     assert (r.reserve.required, r.reserve.dispatched, r.reserve.cost, r.reserve.status) == (D("1.2"), D("1.2"), D("0.24"), "COVERED")
     assert (r.purchase_cost, r.sales_revenue, r.margin) == (D("0.18"), D("0.42"), D("0.00"))
     iv = {i.interval_start: i for i in r.intervals}
     assert iv[i2].reserve.status == "NOT_NEEDED" and iv[i2].reserve.cost == 0
-    assert {a.position.id: a.reason for a in iv[i2].allocations} == {
-        "o1": "PARTIALLY_ALLOCATED", "o2": "PRICE_NOT_MET", "d2": "FULLY_ALLOCATED"}
+    # S = 3,5 > D = 1,8: pro rata 1,286 und 0,514 (Rest 0,001 an das ältere Angebot)
+    assert {a.position.id: (a.allocated, a.reason) for a in iv[i2].allocations} == {
+        "o1": (D("1.286"), "PARTIALLY_ALLOCATED"), "o2": (D("0.514"), "PARTIALLY_ALLOCATED"),
+        "d2": (D("1.8"), "FULLY_ALLOCATED")}
 
 
 def test_kein_bedarf_not_needed():

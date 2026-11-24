@@ -10,7 +10,7 @@ from egsim.config import parse_config
 from egsim.mockserver import MockPlatform
 from egsim.simulator import Simulator
 
-from test_e2e_mock import _setup
+from test_e2e_mock import _setup, operator_closes
 
 POSITION = {
     "id": "6b1a8f3e-2d94-4a77-9c1e-0f5e8a7b1234", "energyCommunityId": "3f6c1c8e-5b1f-4c37-a8b1-1c6d9b9d2a10",
@@ -18,7 +18,7 @@ POSITION = {
     "priceExpectationEurPerKwh": Decimal("0.09"), "status": "OPEN", "rejectionReason": None,
     "createdAt": "2026-11-18T09:00:00Z", "updatedAt": "2026-11-18T09:00:00Z",
 }
-ERROR = {"code": "FORBIDDEN", "message": "nope"}
+ERROR = {"code": "FORBIDDEN", "message": "nope", "requestId": "req-1"}
 
 
 def check(status, body, method="GET", template="/positions/{id}", ctype="application/json"):
@@ -71,11 +71,12 @@ def test_pflichtfeld_fehlt():
 
 
 def test_fehlerformat():
-    assert "kein erlaubter Wert" in messages(check(403, {"code": "NOPE", "message": "x"}))
-    assert "/message: Pflichtfeld fehlt" in messages(check(403, {"code": "FORBIDDEN"}))
+    assert "kein erlaubter Wert" in messages(check(403, {"code": "NOPE", "message": "x", "requestId": "r"}))
+    assert "/message: Pflichtfeld fehlt" in messages(check(403, {"code": "FORBIDDEN", "requestId": "r"}))
+    assert "/requestId: Pflichtfeld fehlt" in messages(check(403, {"code": "FORBIDDEN", "message": "x"}))
     assert "/details/0/field: Pflichtfeld fehlt" in messages(
-        check(400, {"code": "VALIDATION_FAILED", "message": "x", "details": [{"message": "m"}]}))
-    assert check(400, {"code": "VALIDATION_FAILED", "message": "x",
+        check(400, {"code": "VALIDATION_FAILED", "message": "x", "requestId": "r", "details": [{"message": "m"}]}))
+    assert check(400, {"code": "VALIDATION_FAILED", "message": "x", "requestId": "r",
                        "details": [{"field": "/quantityKwh", "code": "INVALID_QUANTITY", "message": "m"}]}) == []
 
 
@@ -87,7 +88,7 @@ def test_body_status_und_content_type():
     # nicht dokumentierter Status: nur Warnung, Fehlerformat wird trotzdem geprüft
     iss = check(418, ERROR)
     assert [s for s, _ in iss] == ["warning"]
-    assert check(500, {"code": "INTERNAL_ERROR", "message": "x"}) == []   # 401/403/500 gelten überall
+    assert check(500, {"code": "INTERNAL_ERROR", "message": "x", "requestId": "r"}) == []  # 401/403/500 gelten überall
 
 
 def test_zugangsdaten_nur_in_den_vorgesehenen_antworten():
@@ -112,7 +113,28 @@ def test_anfrage_schemas_if_then_und_unbekannte_felder():
 
 
 def test_vertragsversion():
-    assert contract.version().startswith("0.2")
+    assert contract.version() == "0.3.1"
+
+
+def test_header_pruefung():
+    hdr = {"x-request-id": "egsim-1", "api-version": "0.3.1"}
+    assert contract.check_headers("GET", "/positions/{id}", 200, hdr, POSITION, "egsim-1") == []
+    msg = messages(contract.check_headers("GET", "/positions/{id}", 200, {"api-version": "0.3.1"}, POSITION))
+    assert "X-Request-Id" in msg
+    msg = messages(contract.check_headers("GET", "/positions/{id}", 200, {**hdr, "x-request-id": "andere"}, POSITION,
+                                          "egsim-1"))
+    assert "X-Request-Id" in msg
+    assert "Api-Version" in messages(contract.check_headers("GET", "/positions/{id}", 200,
+                                                            {"x-request-id": "egsim-1"}, POSITION, "egsim-1"))
+    # requestId im Fehler muss zum Header passen, 429 braucht Retry-After
+    assert "requestId" in messages(contract.check_headers("GET", "/positions/{id}", 403, hdr,
+                                                          {**ERROR, "requestId": "x"}, "egsim-1"))
+    assert "Retry-After" in messages(contract.check_headers("POST", "/auth/login", 429, hdr,
+                                                            {"code": "RATE_LIMITED", "message": "m", "requestId": "egsim-1"},
+                                                            "egsim-1"))
+    # andere Minor-Version: nur Warnung
+    iss = contract.check_headers("GET", "/positions/{id}", 200, {**hdr, "api-version": "0.4.0"}, POSITION, "egsim-1")
+    assert iss and all(s == "warning" for s, _ in iss)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -130,11 +152,11 @@ class SchemaBruch(MockPlatform):
         return status, body
 
 
-def test_simulator_meldet_schemafehler():
+def test_simulator_meldet_schemafehler(monkeypatch):
     p = SchemaBruch()
     srv, raw, d = _setup(p)
     try:
-        threading.Timer(2, p.close_market, args=(d,)).start()
+        operator_closes(monkeypatch, p)
         rep = Simulator(parse_config({**raw, "run": {**raw["run"], "waitForSettlementMinutes": 1}})).run()
     finally:
         srv.shutdown()
